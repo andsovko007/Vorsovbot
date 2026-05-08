@@ -324,7 +324,7 @@ async function finishQuiz(ctx, session) {
     status: CRM_STATUS.quiz_completed,
     diagnosis_completed_at: new Date().toISOString(),
     warmup_started_at: new Date().toISOString(),
-    current_warmup_day: 1,
+    current_warmup_day: 2,
     hot_followup_sent: false,
   };
 
@@ -503,7 +503,9 @@ bot.command('admin_reload', async (ctx) => {
 bot.command('admin_preview_warmup', async (ctx) => {
   if (!isAdmin(ctx)) return;
   const content = await loadContent(true);
-  const rows = content.warmup.filter(r => String(r.id).startsWith('day_') || r.id === 'hot_1');
+  const rows = content.warmup.filter(r =>
+    r.id === 'hot_1' || (String(r.id).startsWith('day_') && r.id !== 'day_1')
+  );
 
   for (const row of rows) {
     await sendHtml(ctx, `<b>${row.id}</b>\n\n${row.text}`, actionKeyboard([
@@ -598,7 +600,7 @@ async function runWarmupTick() {
     console.log(`Warmup tick: ${active.length} active leads`);
 
     for (const lead of active) {
-      const day = Number(lead.current_warmup_day || 1);
+      const day = Math.max(2, Number(lead.current_warmup_day || 2));
       const sendAfter = new Date(
         new Date(lead.warmup_started_at).getTime() + (day - 1) * 24 * 60 * 60 * 1000
       );
