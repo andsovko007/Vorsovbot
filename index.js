@@ -1,8 +1,9 @@
 import { Bot, InlineKeyboard } from 'grammy';
+import cron from 'node-cron';
 
 const ENV = {
   BOT_TOKEN: process.env.BOT_TOKEN,
-  ADMIN_CHAT_ID: String(process.env.ADMIN_CHAT_ID || ''),
+  ADMIN_CHAT_ID: String(process.env.ADMIN_CHAT_ID || '').trim(),
   SHEETS_WEBAPP_URL: process.env.SHEETS_WEBAPP_URL,
   SHEETS_API_SECRET: process.env.SHEETS_API_SECRET,
   TEST_MODE: String(process.env.TEST_MODE || 'false') === 'true',
@@ -36,7 +37,7 @@ const CRM_STATUS = {
 };
 
 function isAdmin(ctx) {
-  return String(ctx.from?.id || '') === ENV.ADMIN_CHAT_ID;
+  return String(ctx.from?.id || '').trim() === String(ENV.ADMIN_CHAT_ID || '').trim();
 }
 
 async function apiGet(action) {
@@ -132,6 +133,11 @@ async function loadContent(force = false) {
   CONTENT = parseRows(json.content);
   LAST_CONTENT_LOAD = now;
   return CONTENT;
+}
+
+async function getCrmLeads() {
+  const json = await apiGet('getCrmLeads');
+  return json.leads || [];
 }
 
 function callback(type, value) {
@@ -328,15 +334,30 @@ async function finishQuiz(ctx, session) {
   await logEvent(user, 'result_sent', { segment_code, readiness });
 
   if (ENV.ADMIN_CHAT_ID) {
+    const managerHint = readiness === 'hot'
+      ? 'Горячий — позвонить сегодня'
+      : readiness === 'warm'
+      ? 'Тёплый — написать в течение дня'
+      : 'Холодный — в прогрев';
+
     await bot.api.sendMessage(
       ENV.ADMIN_CHAT_ID,
       [
-        'Новая диагностика',
+        '🔔 Новая диагностика',
         `Имя: ${user.name}`,
         `Username: @${user.username || '-'}`,
+        '',
+        `Q1: ${answers.q1 || '-'}`,
+        `Q2: ${answers.q2 || '-'}`,
+        `Q3: ${answers.q3 || '-'}`,
+        `Q4: ${answers.q4 || '-'}`,
+        `Q5: ${answers.q5 || '-'}`,
+        `Q6: ${answers.q6 || '-'}`,
+        `Q7: ${answers.q7 || '-'}`,
+        '',
         `Сегмент: ${segment_code} — ${segment_name}`,
         `Готовность: ${readiness}`,
-        `Стопор: ${answers.q5}`,
+        `Подсказка: ${managerHint}`,
       ].join('\n')
     );
   }
@@ -420,9 +441,9 @@ bot.callbackQuery(/^answer:/, async (ctx) => {
   }
 });
 
-bot.on('message:text', async (ctx) => {
+bot.on('message:text', async (ctx, next) => {
   const text = ctx.message.text || '';
-  if (text.startsWith('/')) return;
+  if (text.startsWith('/')) return next();
 
   const user = getUser(ctx);
 
@@ -445,14 +466,31 @@ bot.on('message:text', async (ctx) => {
   });
 });
 
+bot.command('myid', async (ctx) => {
+  const id = String(ctx.from?.id || '').trim();
+  await ctx.reply(`your_id=${id}\nadmin_id=${ENV.ADMIN_CHAT_ID}\nmatch=${id === ENV.ADMIN_CHAT_ID}`);
+});
+
 bot.command('health', async (ctx) => {
-  if (!isAdmin(ctx)) return;
+  if (!isAdmin(ctx)) {
+    const id = String(ctx.from?.id || '');
+    await ctx.reply(`Нет доступа\nyour_id=${id}\nadmin_id=${ENV.ADMIN_CHAT_ID}`);
+    return;
+  }
   try {
     const health = await apiGet('health');
     const content = await loadContent(true);
-    await ctx.reply(`OK\nSheets: ${health.ok}\nContent rows: ${Object.keys(content.segments).length} segments, ${content.questions.length} questions`);
+    const qOk = content.questions.length === 7;
+    const sOk = Object.keys(content.segments).length === 4;
+    await ctx.reply([
+      '✅ Бот жив',
+      `✅ API health: ok (ts=${health.ts})`,
+      '✅ Контент читается',
+      `${qOk ? '✅' : '❌'} Вопросов: ${content.questions.length} (ожидается 7)`,
+      `${sOk ? '✅' : '❌'} Сегментов: ${Object.keys(content.segments).length} (ожидается 4)`,
+    ].join('\n'));
   } catch (e) {
-    await ctx.reply(`ERROR\n${e.message}`);
+    await ctx.reply(`❌ ERROR\n${e.message}`);
   }
 });
 
@@ -550,6 +588,55 @@ bot.command('test_hot_followup', async (ctx) => {
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
+
+async function runWarmupTick() {
+  try {
+    const content = await loadContent();
+    const leads = await getCrmLeads();
+
+    const active = leads.filter(l => l.warmup_started_at && !l.warmup_stopped_at);
+    console.log(`Warmup tick: ${active.length} active leads`);
+
+    for (const lead of active) {
+      const day = Number(lead.current_warmup_day || 1);
+      const sendAfter = new Date(
+        new Date(lead.warmup_started_at).getTime() + (day - 1) * 24 * 60 * 60 * 1000
+      );
+      if (Date.now() < sendAfter.getTime()) continue;
+
+      const row = content.warmup.find(r => r.id === `day_${day}`);
+
+      if (!row) {
+        await upsertLead(
+          { telegram_id: String(lead.telegram_id), username: '', name: '' },
+          { warmup_stopped_at: new Date().toISOString(), status: CRM_STATUS.warmup_stopped }
+        );
+        console.log(`Warmup complete: ${lead.telegram_id}`);
+        continue;
+      }
+
+      try {
+        await sendHtml(bot, Number(lead.telegram_id), String(row.text), actionKeyboard([
+          { text: row.button_1, type: row.type_1 },
+          { text: row.button_2, type: row.type_2 },
+        ], content.settings));
+
+        await upsertLead(
+          { telegram_id: String(lead.telegram_id), username: '', name: '' },
+          { current_warmup_day: day + 1, status: CRM_STATUS.in_warmup }
+        );
+
+        console.log(`Warmup sent: ${lead.telegram_id} day=${day}`);
+      } catch (sendErr) {
+        console.error(`Warmup send failed for ${lead.telegram_id}:`, sendErr.message);
+      }
+    }
+  } catch (e) {
+    console.error('Warmup tick error:', e.message);
+  }
+}
+
+cron.schedule('0 * * * *', runWarmupTick);
 
 bot.catch((err) => {
   console.error('Bot error:', err);
