@@ -111,15 +111,39 @@ function getCrmLeads_() {
   if (!sheet) throw new Error('Лист CRM не найден');
 
   const values = sheet.getDataRange().getValues();
-  const headers = values.shift();
+  values.shift(); // убираем заголовки — возвращаем по индексам, не по русским именам
 
   return values
-    .filter(row => row[2])
-    .map(row => {
-      const obj = {};
-      headers.forEach((h, i) => obj[h] = row[i]);
-      return obj;
-    });
+    .filter(row => row[2]) // col 3 = telegram_id
+    .map(row => ({
+      created_at:             row[0],
+      last_event_at:          row[1],
+      telegram_id:            String(row[2]),
+      username:               row[3],
+      name:                   row[4],
+      source:                 row[5],
+      q1:                     row[6],
+      q2:                     row[7],
+      q3:                     row[8],
+      q4:                     row[9],
+      q5:                     row[10],
+      q6:                     row[11],
+      q7:                     row[12],
+      segment_code:           row[13],
+      segment_name:           row[14],
+      readiness:              row[15],
+      goal_tag:               row[16],
+      payment_tag:            row[17],
+      last_cta:               row[18],
+      status:                 row[19],
+      manager:                row[20],
+      comment:                row[21],
+      diagnosis_completed_at: row[22],
+      warmup_started_at:      row[23],
+      current_warmup_day:     row[24],
+      hot_followup_sent:      row[25],
+      warmup_stopped_at:      row[26],
+    }));
 }
 
 function upsertLead_(p) {
@@ -145,30 +169,37 @@ function upsertLead_(p) {
   }
 
   const existing = targetRow ? sheet.getRange(targetRow, 1, 1, 27).getValues()[0] : null;
+  const e = existing || [];
+  // при update берём existing[N] если новое значение пустое
+  const keep = (val, fallback) => {
+    if (val !== undefined && val !== null && val !== '') return val;
+    if (fallback !== undefined && fallback !== null && fallback !== '') return fallback;
+    return '';
+  };
 
   const row = [
     existing ? existing[0] : (p.created_at || now),
     p.last_event_at || now,
     telegramId,
-    p.username || '',
-    p.name || '',
-    p.source || 'telegram',
-    p.q1 || '',
-    p.q2 || '',
-    p.q3 || '',
-    p.q4 || '',
-    p.q5 || '',
-    p.q6 || '',
-    p.q7 || '',
-    p.segment_code || '',
-    p.segment_name || '',
-    p.readiness || '',
-    p.goal_tag || '',
-    p.payment_tag || '',
-    p.last_cta || '',
-    p.status || '',
-    p.manager || '',
-    p.comment || '',
+    keep(p.username, e[3]),
+    keep(p.name, e[4]),
+    keep(p.source, e[5]) || 'telegram',
+    keep(p.q1, e[6]),
+    keep(p.q2, e[7]),
+    keep(p.q3, e[8]),
+    keep(p.q4, e[9]),
+    keep(p.q5, e[10]),
+    keep(p.q6, e[11]),
+    keep(p.q7, e[12]),
+    keep(p.segment_code, e[13]),
+    keep(p.segment_name, e[14]),
+    keep(p.readiness, e[15]),
+    keep(p.goal_tag, e[16]),
+    keep(p.payment_tag, e[17]),
+    keep(p.last_cta, e[18]),
+    keep(p.status, e[19]),
+    keep(p.manager, e[20]),
+    keep(p.comment, e[21]),
     p.diagnosis_completed_at || (existing ? existing[22] : ''),
     p.warmup_started_at || (existing ? existing[23] : ''),
     p.current_warmup_day !== undefined ? p.current_warmup_day : (existing ? existing[24] : ''),

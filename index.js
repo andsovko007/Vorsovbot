@@ -63,7 +63,18 @@ async function apiPost(action, payload = {}, operations = null) {
     }),
   });
 
-  const json = await res.json();
+  const rawText = await res.text();
+  let json;
+  try {
+    json = JSON.parse(rawText);
+  } catch (_) {
+    console.error(
+      `[API] ${action} non-JSON — status=${res.status} ` +
+      `content-type=${res.headers.get('content-type')} ` +
+      `body=${rawText.slice(0, 500)}`
+    );
+    throw new Error(`${action}: non-JSON response (status=${res.status})`);
+  }
   if (!json.ok) throw new Error(json.error || 'Sheets API error');
   return json;
 }
@@ -546,6 +557,26 @@ bot.command('admin_preview_warmup_day', async (ctx) => {
     { text: row.button_1, type: row.type_1 },
     { text: row.button_2, type: row.type_2 },
   ], content.settings));
+});
+
+bot.command('test_upsert_me', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const now = new Date().toISOString();
+  try {
+    const result = await apiPost('upsertLead', {
+      telegram_id: ENV.ADMIN_CHAT_ID,
+      username: 'admin_test',
+      name: 'Admin Test',
+      source: 'telegram',
+      status: CRM_STATUS.quiz_completed,
+      warmup_started_at: now,
+      current_warmup_day: 2,
+      diagnosis_completed_at: now,
+    });
+    await ctx.reply(`✅ upsertLead ok\n${JSON.stringify(result)}`);
+  } catch (e) {
+    await ctx.reply(`❌ upsertLead failed\n${e.message}`);
+  }
 });
 
 bot.command('test_user', async (ctx) => {
