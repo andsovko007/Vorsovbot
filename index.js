@@ -249,12 +249,16 @@ async function appendDiagnosis(user, data) {
 }
 
 async function askQuestion(ctx, session) {
+  const _t0 = Date.now();
   const content = await loadContent();
+  console.log(`[TIMING] askQuestion.loadContent: ${Date.now() - _t0}ms`);
+
   const q = content.questions[session.index];
   if (!q) return finishQuiz(ctx, session);
 
   const options = content.optionsByQuestion[q.id] || [];
   await sendHtml(ctx, String(q.text), keyboardForOptions(q.id, options));
+  console.log(`[TIMING] askQuestion.sendHtml (question sent): ${Date.now() - _t0}ms`);
 }
 
 function calculateReadiness(session) {
@@ -285,7 +289,12 @@ function collectTags(session) {
 }
 
 async function finishQuiz(ctx, session) {
+  const _t0 = Date.now();
+  console.log(`[TIMING] finishQuiz.start`);
+
   const content = await loadContent();
+  console.log(`[TIMING] finishQuiz.loadContent: ${Date.now() - _t0}ms`);
+
   const user = getUser(ctx);
   const readiness = calculateReadiness(session);
   const tags = collectTags(session);
@@ -302,6 +311,7 @@ async function finishQuiz(ctx, session) {
   ].filter(b => b.text);
 
   await sendHtml(ctx, String(segment.text), actionKeyboard(buttons, content.settings));
+  console.log(`[TIMING] finishQuiz.resultSent (user sees result): ${Date.now() - _t0}ms`);
 
   const answers = {
     q1: session.answers.q1 || '',
@@ -328,11 +338,23 @@ async function finishQuiz(ctx, session) {
     hot_followup_sent: false,
   };
 
+  const _tCrm = Date.now();
   await upsertLead(user, leadData);
-  await appendDiagnosis(user, { ...answers, segment_code, segment_name, readiness, ...tags });
-  await logEvent(user, 'quiz_completed', { segment_code, readiness });
-  await logEvent(user, 'result_sent', { segment_code, readiness });
+  console.log(`[TIMING] finishQuiz.upsertLead: ${Date.now() - _tCrm}ms`);
 
+  const _tDiag = Date.now();
+  await appendDiagnosis(user, { ...answers, segment_code, segment_name, readiness, ...tags });
+  console.log(`[TIMING] finishQuiz.appendDiagnosis: ${Date.now() - _tDiag}ms`);
+
+  const _tEv1 = Date.now();
+  await logEvent(user, 'quiz_completed', { segment_code, readiness });
+  console.log(`[TIMING] finishQuiz.logEvent(quiz_completed): ${Date.now() - _tEv1}ms`);
+
+  const _tEv2 = Date.now();
+  await logEvent(user, 'result_sent', { segment_code, readiness });
+  console.log(`[TIMING] finishQuiz.logEvent(result_sent): ${Date.now() - _tEv2}ms`);
+
+  const _tAdmin = Date.now();
   if (ENV.ADMIN_CHAT_ID) {
     const managerHint = readiness === 'hot'
       ? 'Горячий — позвонить сегодня'
@@ -362,11 +384,17 @@ async function finishQuiz(ctx, session) {
     );
   }
 
+  console.log(`[TIMING] finishQuiz.adminAlert: ${Date.now() - _tAdmin}ms`);
+  console.log(`[TIMING] finishQuiz.total: ${Date.now() - _t0}ms`);
+
   sessions.delete(user.telegram_id);
 }
 
 async function startQuiz(ctx) {
+  const _t0 = Date.now();
   const content = await loadContent();
+  console.log(`[TIMING] startQuiz.loadContent: ${Date.now() - _t0}ms`);
+
   const user = getUser(ctx);
 
   const session = {
@@ -378,10 +406,16 @@ async function startQuiz(ctx) {
 
   sessions.set(user.telegram_id, session);
 
+  const _tUpsert = Date.now();
   await upsertLead(user, { status: CRM_STATUS.quiz_started });
+  console.log(`[TIMING] startQuiz.upsertLead: ${Date.now() - _tUpsert}ms`);
+
+  const _tLog = Date.now();
   await logEvent(user, 'quiz_started');
+  console.log(`[TIMING] startQuiz.logEvent: ${Date.now() - _tLog}ms`);
 
   await askQuestion(ctx, session);
+  console.log(`[TIMING] startQuiz.total (first question sent): ${Date.now() - _t0}ms`);
 }
 
 bot.command('start', async (ctx) => {
@@ -407,9 +441,15 @@ bot.callbackQuery(/^restart:/, async (ctx) => {
 });
 
 bot.callbackQuery(/^answer:/, async (ctx) => {
+  const _t0 = Date.now();
+  console.log(`[TIMING] answer.callbackReceived`);
+
   await ctx.answerCallbackQuery();
+  console.log(`[TIMING] answer.answerCallbackQuery: ${Date.now() - _t0}ms`);
 
   const content = await loadContent();
+  console.log(`[TIMING] answer.loadContent: ${Date.now() - _t0}ms`);
+
   const user = getUser(ctx);
   const session = sessions.get(user.telegram_id);
 
@@ -422,6 +462,7 @@ bot.callbackQuery(/^answer:/, async (ctx) => {
   const q = content.questions[session.index];
   const opts = content.optionsByQuestion[q.id] || [];
   const opt = opts.find(o => String(o.id) === optionId);
+  console.log(`[TIMING] answer.optionParsed: ${Date.now() - _t0}ms`);
 
   if (!opt) {
     await ctx.reply('Ответ не найден. Нажмите /start и начните заново.');
@@ -432,13 +473,18 @@ bot.callbackQuery(/^answer:/, async (ctx) => {
   session.selectedOptions[q.id] = opt;
   session.index += 1;
 
+  const _tLog = Date.now();
   await logEvent(user, 'question_answered', { payload: { question_id: q.id, option_id: optionId, text: opt.text } });
+  console.log(`[TIMING] answer.logEvent: ${Date.now() - _tLog}ms  ← BEFORE next question`);
 
   if (session.index >= content.questions.length) {
+    console.log(`[TIMING] answer.goingToFinishQuiz: ${Date.now() - _t0}ms`);
     await finishQuiz(ctx, session);
   } else {
+    console.log(`[TIMING] answer.goingToNextQuestion: ${Date.now() - _t0}ms`);
     await askQuestion(ctx, session);
   }
+  console.log(`[TIMING] answer.total: ${Date.now() - _t0}ms`);
 });
 
 bot.on('message:text', async (ctx, next) => {
