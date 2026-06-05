@@ -52,29 +52,45 @@ async function apiGet(action) {
 }
 
 async function apiPost(action, payload = {}, operations = null) {
-  const res = await fetch(ENV.SHEETS_WEBAPP_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      secret: ENV.SHEETS_API_SECRET,
-      action,
-      payload,
-      operations,
-    }),
+  const body = JSON.stringify({
+    secret: ENV.SHEETS_API_SECRET,
+    action,
+    payload,
+    operations,
   });
 
-  const rawText = await res.text();
+  const options = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    redirect: 'manual',
+  };
+
+  let res = await fetch(ENV.SHEETS_WEBAPP_URL, options);
+
+  if ([301, 302, 303, 307, 308].includes(res.status)) {
+    const location = res.headers.get('location');
+    if (!location) throw new Error(`${action}: redirect without Location`);
+    res = await fetch(location, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+  }
+
+  const text = await res.text();
+  const contentType = res.headers.get('content-type') || '';
+
   let json;
   try {
-    json = JSON.parse(rawText);
+    json = JSON.parse(text);
   } catch (_) {
-    console.error(
-      `[API] ${action} non-JSON — status=${res.status} ` +
-      `content-type=${res.headers.get('content-type')} ` +
-      `body=${rawText.slice(0, 500)}`
+    throw new Error(
+      `${action}: non-JSON response (status=${res.status}) ` +
+      `content-type=${contentType} body=${text.slice(0, 1000)}`
     );
-    throw new Error(`${action}: non-JSON response (status=${res.status})`);
   }
+
   if (!json.ok) throw new Error(json.error || 'Sheets API error');
   return json;
 }
