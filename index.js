@@ -52,31 +52,16 @@ async function apiGet(action) {
 }
 
 async function apiPost(action, payload = {}, operations = null) {
-  const body = JSON.stringify({
-    secret: ENV.SHEETS_API_SECRET,
-    action,
-    payload,
-    operations,
-  });
-
-  const options = {
+  const res = await fetch(ENV.SHEETS_WEBAPP_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body,
-    redirect: 'manual',
-  };
-
-  let res = await fetch(ENV.SHEETS_WEBAPP_URL, options);
-
-  if ([301, 302, 303, 307, 308].includes(res.status)) {
-    const location = res.headers.get('location');
-    if (!location) throw new Error(`${action}: redirect without Location`);
-    res = await fetch(location, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body,
-    });
-  }
+    body: JSON.stringify({
+      secret: ENV.SHEETS_API_SECRET,
+      action,
+      payload,
+      operations,
+    }),
+  });
 
   const text = await res.text();
   const contentType = res.headers.get('content-type') || '';
