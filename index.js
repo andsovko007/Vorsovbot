@@ -9,11 +9,18 @@ const ENV = {
   TEST_MODE: String(process.env.TEST_MODE || 'false') === 'true',
   ALLOW_TEST_COMMANDS: String(process.env.ALLOW_TEST_COMMANDS || 'false') === 'true',
   WARMUP_FAST_DELAY_MS: Number(process.env.WARMUP_FAST_DELAY_MS || 1200),
+  AUTOMATION_ENABLED: String(process.env.AUTOMATION_ENABLED || 'false') === 'true',
+  AUTOMATION_ALLOWED_IDS: (process.env.AUTOMATION_ALLOWED_IDS || '').split(',').map(s => s.trim()).filter(Boolean),
+  INTERNAL_TELEGRAM_IDS: (process.env.INTERNAL_TELEGRAM_IDS || '274328371,289634658').split(',').map(s => s.trim()).filter(Boolean),
+  MAX_AUTOMATION_SENDS_PER_TICK: Number(process.env.MAX_AUTOMATION_SENDS_PER_TICK || 5),
 };
 
 if (!ENV.BOT_TOKEN) throw new Error('BOT_TOKEN is required');
 if (!ENV.SHEETS_WEBAPP_URL) throw new Error('SHEETS_WEBAPP_URL is required');
 if (!ENV.SHEETS_API_SECRET) throw new Error('SHEETS_API_SECRET is required');
+
+const BOT_VERSION = '1.1.0';
+let CRON_STARTED = false;
 
 const bot = new Bot(ENV.BOT_TOKEN);
 const sessions = new Map();
@@ -493,13 +500,114 @@ bot.command('health', async (ctx) => {
     const content = await loadContent(true);
     const qOk = content.questions.length === 7;
     const sOk = Object.keys(content.segments).length === 4;
+
+    let crmTotal = '?';
+    let crmActive = '?';
+    try {
+      const leads = await getCrmLeads();
+      const active = leads.filter(l => l.warmup_started_at && !l.warmup_stopped_at);
+      crmTotal = leads.length;
+      crmActive = active.length;
+    } catch (_) {}
+
     await ctx.reply([
-      '✅ Бот жив',
+      `✅ Бот жив (v${BOT_VERSION})`,
       `✅ API health: ok (ts=${health.ts})`,
       '✅ Контент читается',
       `${qOk ? '✅' : '❌'} Вопросов: ${content.questions.length} (ожидается 7)`,
       `${sOk ? '✅' : '❌'} Сегментов: ${Object.keys(content.segments).length} (ожидается 4)`,
+      `${CRON_STARTED ? '✅' : '❌'} Cron: ${CRON_STARTED ? 'запущен' : 'не запущен'}`,
+      `${ENV.AUTOMATION_ENABLED ? '✅' : '⏸'} Автоматизация: ${ENV.AUTOMATION_ENABLED ? 'включена' : 'выключена'}`,
+      `📋 CRM лидов: ${crmTotal}`,
+      `🔄 Активных прогревов: ${crmActive}`,
     ].join('\n'));
+  } catch (e) {
+    await ctx.reply(`❌ ERROR\n${e.message}`);
+  }
+});
+
+bot.command('admin_automation_status', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  try {
+    const content = await loadContent();
+    const leads = await getCrmLeads();
+    const active = leads.filter(l => l.warmup_started_at && !l.warmup_stopped_at);
+
+    if (active.length === 0) {
+      await ctx.reply('Активных прогревов нет.');
+      return;
+    }
+
+    const lines = [`📊 Прогрев: ${active.length} активных лидов`];
+
+    for (const lead of active) {
+      const day = Math.max(2, Number(lead.current_warmup_day || 2));
+      const sendAfter = new Date(
+        new Date(lead.warmup_started_at).getTime() + (day - 1) * 24 * 60 * 60 * 1000
+      );
+      const nextRow = content.warmup.find(r => r.id === `day_${day}`);
+      const isInternal = ENV.INTERNAL_TELEGRAM_IDS.includes(String(lead.telegram_id));
+
+      lines.push('');
+      lines.push(`👤 ${lead.name || lead.telegram_id}${isInternal ? ' [internal]' : ''}`);
+      lines.push(`   ID: ${lead.telegram_id}`);
+      lines.push(`   Сегмент: ${lead.segment_code || '-'} | Готовность: ${lead.readiness || '-'}`);
+      lines.push(`   Старт прогрева: ${lead.warmup_started_at ? new Date(lead.warmup_started_at).toLocaleDateString('ru') : '-'}`);
+      lines.push(`   Текущий день: ${day}`);
+      lines.push(`   Следующее: ${nextRow ? `day_${day} не раньше ${sendAfter.toLocaleString('ru')}` : 'прогрев завершён'}`);
+    }
+
+    await ctx.reply(lines.join('\n'));
+  } catch (e) {
+    await ctx.reply(`❌ ERROR\n${e.message}`);
+  }
+});
+
+bot.command('admin_warmup_dry', async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  try {
+    const content = await loadContent();
+    const leads = await getCrmLeads();
+    const now = Date.now();
+
+    const active = leads.filter(l => l.warmup_started_at && !l.warmup_stopped_at);
+    const lines = [`🔍 Dry run прогрева (${active.length} активных)`];
+
+    let wouldSend = 0;
+    let wouldSkip = 0;
+    let wouldComplete = 0;
+
+    for (const lead of active) {
+      const day = Math.max(2, Number(lead.current_warmup_day || 2));
+      const sendAfter = new Date(
+        new Date(lead.warmup_started_at).getTime() + (day - 1) * 24 * 60 * 60 * 1000
+      );
+      const isInternal = ENV.INTERNAL_TELEGRAM_IDS.includes(String(lead.telegram_id));
+      const tag = isInternal ? ' [internal]' : '';
+
+      if (now < sendAfter.getTime()) {
+        const hoursLeft = Math.ceil((sendAfter.getTime() - now) / 3600000);
+        lines.push(`⏳ ${lead.telegram_id}${tag} — day_${day}, ждать ещё ~${hoursLeft}ч`);
+        wouldSkip++;
+        continue;
+      }
+
+      const row = content.warmup.find(r => r.id === `day_${day}`);
+      if (!row) {
+        lines.push(`🏁 ${lead.telegram_id}${tag} — day_${day} не найден → прогрев завершён`);
+        wouldComplete++;
+        continue;
+      }
+
+      lines.push(`📤 ${lead.telegram_id}${tag} — day_${day}: "${String(row.text).slice(0, 60)}..."`);
+      wouldSend++;
+    }
+
+    lines.push('');
+    lines.push(`Итого: отправить ${wouldSend} | ждать ${wouldSkip} | завершить ${wouldComplete}`);
+    lines.push('⚠️ Реальная отправка НЕ выполнена');
+
+    await ctx.reply(lines.join('\n'));
   } catch (e) {
     await ctx.reply(`❌ ERROR\n${e.message}`);
   }
@@ -674,6 +782,7 @@ async function runWarmupTick() {
 }
 
 cron.schedule('0 * * * *', runWarmupTick);
+CRON_STARTED = true;
 
 bot.catch((err) => {
   console.error('Bot error:', err);
