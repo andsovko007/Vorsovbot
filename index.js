@@ -516,7 +516,7 @@ bot.command('health', async (ctx) => {
       '✅ Контент читается',
       `${qOk ? '✅' : '❌'} Вопросов: ${content.questions.length} (ожидается 7)`,
       `${sOk ? '✅' : '❌'} Сегментов: ${Object.keys(content.segments).length} (ожидается 4)`,
-      `${CRON_STARTED ? '✅' : '❌'} Cron: ${CRON_STARTED ? 'запущен' : 'не запущен'}`,
+      `${CRON_STARTED ? '✅' : '❌'} Cron: ${CRON_STARTED ? 'registered' : 'not registered'}`,
       `${ENV.AUTOMATION_ENABLED ? '✅' : '⏸'} Автоматизация: ${ENV.AUTOMATION_ENABLED ? 'включена' : 'выключена'}`,
       `📋 CRM лидов: ${crmTotal}`,
       `🔄 Активных прогревов: ${crmActive}`,
@@ -735,14 +735,32 @@ function background(taskName, promise) {
 }
 
 async function runWarmupTick() {
+  if (!ENV.AUTOMATION_ENABLED) {
+    console.log('[AUTOMATION] Warmup disabled');
+    return;
+  }
+
   try {
     const content = await loadContent();
     const leads = await getCrmLeads();
 
-    const active = leads.filter(l => l.warmup_started_at && !l.warmup_stopped_at);
-    console.log(`Warmup tick: ${active.length} active leads`);
+    let active = leads.filter(l => l.warmup_started_at && !l.warmup_stopped_at);
+
+    // Если AUTOMATION_ALLOWED_IDS задан — обрабатывать только этих
+    if (ENV.AUTOMATION_ALLOWED_IDS.length > 0) {
+      active = active.filter(l => ENV.AUTOMATION_ALLOWED_IDS.includes(String(l.telegram_id)));
+    }
+
+    console.log(`Warmup tick: ${active.length} active leads (allowed_ids filter: ${ENV.AUTOMATION_ALLOWED_IDS.length > 0 ? 'on' : 'off'})`);
+
+    let sentCount = 0;
 
     for (const lead of active) {
+      if (sentCount >= ENV.MAX_AUTOMATION_SENDS_PER_TICK) {
+        console.log(`[AUTOMATION] Reached MAX_AUTOMATION_SENDS_PER_TICK (${ENV.MAX_AUTOMATION_SENDS_PER_TICK}), stopping tick`);
+        break;
+      }
+
       const day = Math.max(2, Number(lead.current_warmup_day || 2));
       const sendAfter = new Date(
         new Date(lead.warmup_started_at).getTime() + (day - 1) * 24 * 60 * 60 * 1000
@@ -771,7 +789,8 @@ async function runWarmupTick() {
           { current_warmup_day: day + 1, status: CRM_STATUS.in_warmup }
         );
 
-        console.log(`Warmup sent: ${lead.telegram_id} day=${day}`);
+        sentCount++;
+        console.log(`Warmup sent: ${lead.telegram_id} day=${day} (${sentCount}/${ENV.MAX_AUTOMATION_SENDS_PER_TICK})`);
       } catch (sendErr) {
         console.error(`Warmup send failed for ${lead.telegram_id}:`, sendErr.message);
       }
