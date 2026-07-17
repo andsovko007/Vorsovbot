@@ -146,74 +146,102 @@ function getCrmLeads_() {
     }));
 }
 
+const STATUS_ORDER_ = [
+  'Новый', 'Начал диагностику', 'Прошёл диагностику', 'В прогреве',
+  'Перешёл в канал', 'Нажал разбор', 'Связаться вручную',
+  'Записан на разбор', 'Разбор проведён', 'Бронь', 'Сделка'
+];
+const LOCKED_STATUSES_ = ['Сделка', 'Нецелевой', 'Прогрев остановлен', 'Прогрев завершён'];
+
+function safeStatus_(newStatus, existingStatus) {
+  if (!newStatus) return existingStatus || '';
+  if (!existingStatus) return newStatus;
+  if (LOCKED_STATUSES_.indexOf(existingStatus) !== -1) return existingStatus;
+  const newIdx = STATUS_ORDER_.indexOf(newStatus);
+  const existIdx = STATUS_ORDER_.indexOf(existingStatus);
+  if (newIdx !== -1 && existIdx !== -1 && newIdx < existIdx) return existingStatus;
+  return newStatus;
+}
+
 function upsertLead_(p) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName('CRM');
-  if (!sheet) throw new Error('Лист CRM не найден');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('CRM');
+    if (!sheet) throw new Error('Лист CRM не найден');
 
-  const telegramId = String(p.telegram_id || '');
-  if (!telegramId) throw new Error('telegram_id required');
+    const telegramId = String(p.telegram_id || '');
+    if (!telegramId) throw new Error('telegram_id required');
 
-  const now = new Date();
-  const lastRow = Math.max(sheet.getLastRow(), 1);
+    const now = new Date();
+    const lastRow = Math.max(sheet.getLastRow(), 1);
 
-  let targetRow = 0;
-  if (lastRow >= 2) {
-    const ids = sheet.getRange(2, 3, lastRow - 1, 1).getValues();
-    for (let i = 0; i < ids.length; i++) {
-      if (String(ids[i][0]) === telegramId) {
-        targetRow = i + 2;
-        break;
+    let targetRow = 0;
+    if (lastRow >= 2) {
+      const ids = sheet.getRange(2, 3, lastRow - 1, 1).getValues();
+      for (let i = 0; i < ids.length; i++) {
+        if (String(ids[i][0]) === telegramId) {
+          targetRow = i + 2;
+          break;
+        }
       }
     }
+
+    const existing = targetRow ? sheet.getRange(targetRow, 1, 1, 27).getValues()[0] : null;
+    const e = existing || [];
+    const keep = (val, fallback) => {
+      if (val !== undefined && val !== null && val !== '') return val;
+      if (fallback !== undefined && fallback !== null && fallback !== '') return fallback;
+      return '';
+    };
+
+    // source: для существующей строки НИКОГДА не перезаписываем
+    const sourceValue = existing ? (e[5] || p.source || 'telegram') : (p.source || 'telegram');
+
+    // status: защита от отката и блокировка финальных статусов
+    const statusValue = safeStatus_(p.status, existing ? String(e[19] || '') : '');
+
+    const row = [
+      existing ? existing[0] : (p.created_at || now),
+      p.last_event_at || now,
+      telegramId,
+      keep(p.username, e[3]),
+      keep(p.name, e[4]),
+      sourceValue,
+      keep(p.q1, e[6]),
+      keep(p.q2, e[7]),
+      keep(p.q3, e[8]),
+      keep(p.q4, e[9]),
+      keep(p.q5, e[10]),
+      keep(p.q6, e[11]),
+      keep(p.q7, e[12]),
+      keep(p.segment_code, e[13]),
+      keep(p.segment_name, e[14]),
+      keep(p.readiness, e[15]),
+      keep(p.goal_tag, e[16]),
+      keep(p.payment_tag, e[17]),
+      keep(p.last_cta, e[18]),
+      statusValue,
+      keep(p.manager, e[20]),
+      keep(p.comment, e[21]),
+      p.diagnosis_completed_at || (existing ? existing[22] : ''),
+      p.warmup_started_at || (existing ? existing[23] : ''),
+      p.current_warmup_day !== undefined ? p.current_warmup_day : (existing ? existing[24] : ''),
+      p.hot_followup_sent !== undefined ? p.hot_followup_sent : (existing ? existing[25] : false),
+      p.warmup_stopped_at || (existing ? existing[26] : '')
+    ];
+
+    if (targetRow) {
+      sheet.getRange(targetRow, 1, 1, row.length).setValues([row]);
+      return { updated: true, row: targetRow };
+    }
+
+    sheet.appendRow(row);
+    return { inserted: true, row: sheet.getLastRow() };
+  } finally {
+    lock.releaseLock();
   }
-
-  const existing = targetRow ? sheet.getRange(targetRow, 1, 1, 27).getValues()[0] : null;
-  const e = existing || [];
-  // при update берём existing[N] если новое значение пустое
-  const keep = (val, fallback) => {
-    if (val !== undefined && val !== null && val !== '') return val;
-    if (fallback !== undefined && fallback !== null && fallback !== '') return fallback;
-    return '';
-  };
-
-  const row = [
-    existing ? existing[0] : (p.created_at || now),
-    p.last_event_at || now,
-    telegramId,
-    keep(p.username, e[3]),
-    keep(p.name, e[4]),
-    keep(p.source, e[5]) || 'telegram',
-    keep(p.q1, e[6]),
-    keep(p.q2, e[7]),
-    keep(p.q3, e[8]),
-    keep(p.q4, e[9]),
-    keep(p.q5, e[10]),
-    keep(p.q6, e[11]),
-    keep(p.q7, e[12]),
-    keep(p.segment_code, e[13]),
-    keep(p.segment_name, e[14]),
-    keep(p.readiness, e[15]),
-    keep(p.goal_tag, e[16]),
-    keep(p.payment_tag, e[17]),
-    keep(p.last_cta, e[18]),
-    keep(p.status, e[19]),
-    keep(p.manager, e[20]),
-    keep(p.comment, e[21]),
-    p.diagnosis_completed_at || (existing ? existing[22] : ''),
-    p.warmup_started_at || (existing ? existing[23] : ''),
-    p.current_warmup_day !== undefined ? p.current_warmup_day : (existing ? existing[24] : ''),
-    p.hot_followup_sent !== undefined ? p.hot_followup_sent : (existing ? existing[25] : false),
-    p.warmup_stopped_at || (existing ? existing[26] : '')
-  ];
-
-  if (targetRow) {
-    sheet.getRange(targetRow, 1, 1, row.length).setValues([row]);
-    return { updated: true, row: targetRow };
-  }
-
-  sheet.appendRow(row);
-  return { inserted: true, row: sheet.getLastRow() };
 }
 
 function appendEvent_(p) {
@@ -259,4 +287,240 @@ function appendDiagnosis_(p) {
     p.goal_tag || '',
     p.payment_tag || ''
   ]);
+}
+
+// ==================================================
+// CRM VALIDATION & FORMATTING
+// ==================================================
+
+function updateCrmStatusValidation_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('CRM');
+  if (!sheet) return;
+
+  const VALID_STATUSES = [
+    'Новый', 'Начал диагностику', 'Прошёл диагностику',
+    'Нажал разбор', 'Перешёл в канал', 'В прогреве',
+    'Связаться вручную', 'Записан на разбор', 'Разбор проведён',
+    'Бронь', 'Сделка', 'Прогрев остановлен', 'Прогрев завершён', 'Нецелевой'
+  ];
+
+  const lastRow = Math.max(sheet.getLastRow(), 2);
+  const statusRange = sheet.getRange(2, 20, lastRow - 1, 1); // col T
+
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(VALID_STATUSES, true)
+    .setAllowInvalid(true)
+    .build();
+  statusRange.setDataValidation(rule);
+
+  const fmtRange = sheet.getRange(2, 1, lastRow - 1, 27);
+  const colorMap = {
+    'Сделка':             '#0f9d58',
+    'Бронь':              '#34a853',
+    'Записан на разбор':  '#4285f4',
+    'Нажал разбор':       '#fbbc05',
+    'Перешёл в канал':    '#fff176',
+    'В прогреве':         '#b3e5fc',
+    'Прошёл диагностику': '#e8f5e9',
+    'Начал диагностику':  '#f1f8e9',
+    'Новый':              '#ffffff',
+    'Прогрев завершён':   '#eeeeee',
+    'Прогрев остановлен': '#ffcdd2',
+    'Нецелевой':          '#ffcdd2',
+    'Связаться вручную':  '#ffe0b2',
+    'Разбор проведён':    '#e8eaf6',
+  };
+
+  const rules = Object.keys(colorMap).map(function(status) {
+    return SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=$T2="' + status + '"')
+      .setBackground(colorMap[status])
+      .setRanges([fmtRange])
+      .build();
+  });
+  sheet.setConditionalFormatRules(rules);
+}
+
+// ==================================================
+// DASHBOARD REPAIR (only touches Дашборд sheet)
+// ==================================================
+
+function repairDashboardAnalyticsOnly() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dashSheet = ss.getSheetByName('Дашборд');
+  if (!dashSheet) throw new Error('Лист Дашборд не найден');
+
+  const EXCLUDED_IDS = ['274328371', '289634658'];
+
+  function isExcluded(tid) {
+    return EXCLUDED_IDS.indexOf(String(tid)) !== -1;
+  }
+
+  // Read events
+  const evtSheet = ss.getSheetByName('_История событий');
+  const evtData = evtSheet ? evtSheet.getDataRange().getValues() : [];
+  if (evtData.length > 1) evtData.shift(); else evtData.splice(0);
+
+  const events = evtData.filter(function(r) {
+    const tid = String(r[2] || '');
+    const src = String(r[9] || '');
+    return tid && !isExcluded(tid) && src !== 'test' && src !== 'internal';
+  });
+
+  // Group by event_type → unique telegram_ids
+  const byType = {};
+  const bookingByOrigin = {};
+
+  events.forEach(function(r) {
+    const etype = String(r[5] || '');
+    const tid   = String(r[2] || '');
+    if (!etype || !tid) return;
+    if (!byType[etype]) byType[etype] = {};
+    byType[etype][tid] = true;
+
+    if (etype === 'booking_clicked') {
+      var origin = '';
+      try { origin = JSON.parse(String(r[6] || '{}')).origin || ''; } catch(_) {}
+      if (origin) {
+        if (!bookingByOrigin[origin]) bookingByOrigin[origin] = {};
+        bookingByOrigin[origin][tid] = true;
+      }
+    }
+  });
+
+  function uniq(t) { return Object.keys(byType[t] || {}).length; }
+  function bookingOriginCount(o) { return Object.keys(bookingByOrigin[o] || {}).length; }
+
+  // CRM
+  const crmLeads = getCrmLeads_().filter(function(l) { return !isExcluded(l.telegram_id); });
+  const extLeads = crmLeads.filter(function(l) {
+    var src = String(l.source || '');
+    return src !== 'test' && src !== 'internal';
+  });
+
+  // Status counts
+  const statusCounts = {};
+  extLeads.forEach(function(l) {
+    var s = String(l.status || '—');
+    statusCounts[s] = (statusCounts[s] || 0) + 1;
+  });
+
+  // Segment & readiness counts
+  const segCounts = {}, readCounts = {};
+  extLeads.forEach(function(l) {
+    if (l.segment_code) segCounts[l.segment_code] = (segCounts[l.segment_code] || 0) + 1;
+    if (l.readiness)    readCounts[l.readiness]    = (readCounts[l.readiness]    || 0) + 1;
+  });
+  const total = Math.max(extLeads.length, 1);
+
+  // Active warmup (v2 only)
+  const activeV2 = crmLeads.filter(function(l) {
+    return l.source === 'telegram_v2' && l.warmup_started_at && !l.warmup_stopped_at;
+  }).length;
+
+  // Hot without followup sent
+  const hotNoFollowup = extLeads.filter(function(l) {
+    return l.readiness === 'hot' && String(l.hot_followup_sent).toUpperCase() !== 'TRUE';
+  }).length;
+
+  // CTA (booking OR channel)
+  const ctaIds = {};
+  Object.keys(byType['booking_clicked'] || {}).forEach(function(id) { ctaIds[id] = true; });
+  Object.keys(byType['channel_clicked']  || {}).forEach(function(id) { ctaIds[id] = true; });
+  const ctaTotal = Object.keys(ctaIds).length;
+
+  // Build output
+  var out = [];
+
+  out.push(['ОСНОВНАЯ ВОРОНКА', 'Уникальных']);
+  out.push(['Зашли (bot_started)',        uniq('bot_started')]);
+  out.push(['Начали (quiz_started)',       uniq('quiz_started')]);
+  out.push(['Прошли (quiz_completed)',     uniq('quiz_completed')]);
+  out.push(['CTA (booking или channel)',   ctaTotal]);
+  out.push(['Разбор (booking_clicked)',    uniq('booking_clicked')]);
+  out.push(['', '']);
+
+  out.push(['ТЕКУЩИЕ СТАТУСЫ CRM', 'Лидов']);
+  var allStatuses = [
+    'Новый','Начал диагностику','Прошёл диагностику','В прогреве',
+    'Перешёл в канал','Нажал разбор','Связаться вручную',
+    'Записан на разбор','Разбор проведён','Бронь','Сделка',
+    'Прогрев остановлен','Прогрев завершён','Нецелевой'
+  ];
+  allStatuses.forEach(function(s) { out.push([s, statusCounts[s] || 0]); });
+  out.push(['', '']);
+
+  out.push(['СЕГМЕНТЫ', 'Лидов', 'Конверсия']);
+  Object.keys(segCounts).sort().forEach(function(code) {
+    var cnt = segCounts[code];
+    out.push(['Сегмент ' + code, cnt, Math.min(100, Math.round(cnt / total * 100)) + '%']);
+  });
+  out.push(['', '']);
+
+  out.push(['ГОТОВНОСТЬ', 'Лидов']);
+  Object.keys(readCounts).forEach(function(r) { out.push([r, readCounts[r]]); });
+  out.push(['', '']);
+
+  // Warmup funnel by day
+  var noMsgDays = [9, 11, 13, 23, 25];
+  var allWarmupNums = [2,3,4,5,6,7,8,9,10,11,12,13,14,22,23,24,25,26,28,30];
+  out.push(['ПРОГРЕВ ПО ДНЯМ', 'Уникальных', 'Примечание']);
+  out.push(['Результат диагностики (result_sent)', uniq('result_sent'), '']);
+  allWarmupNums.forEach(function(n) {
+    var note = noMsgDays.indexOf(n) !== -1 ? 'Нет сообщения по плану' : '';
+    out.push(['День ' + n, uniq('warmup_day_' + n + '_sent'), note]);
+  });
+  out.push(['', '']);
+
+  // Booking by origin
+  var warmupClickDays = [2,3,4,5,6,7,8,10,12,14,22,24,26,28,30];
+  out.push(['НАЖАЛИ РАЗБОР ПО ДНЮ', 'Уникальных']);
+  out.push(['result (после диагностики)', bookingOriginCount('result')]);
+  out.push(['hot_1',                      bookingOriginCount('hot_1')]);
+  warmupClickDays.forEach(function(n) {
+    out.push(['day_' + n, bookingOriginCount('day_' + n)]);
+  });
+  out.push(['', '']);
+
+  // Focus today
+  var noNextStep = extLeads.filter(function(l) {
+    return !l.warmup_started_at && l.status === 'Прошёл диагностику';
+  }).length;
+  var topSeg = Object.keys(segCounts).sort(function(a,b){ return segCounts[b]-segCounts[a]; })[0];
+
+  out.push(['ФОКУС НА СЕГОДНЯ', '']);
+  out.push(['Горячие без разбора',              hotNoFollowup]);
+  out.push(['Нажали разбор (booking_clicked)',   uniq('booking_clicked')]);
+  out.push(['Без следующего шага',               noNextStep]);
+  out.push(['В активном прогреве (v2)',           activeV2]);
+  out.push(['Самый частый сегмент', topSeg ? 'Сегмент ' + topSeg + ' (' + segCounts[topSeg] + ')' : '—']);
+
+  // Write
+  dashSheet.clearContents();
+  var maxCols = 0;
+  out.forEach(function(r) { if (r.length > maxCols) maxCols = r.length; });
+  var padded = out.map(function(r) {
+    while (r.length < maxCols) r.push('');
+    return r;
+  });
+  dashSheet.getRange(1, 1, padded.length, maxCols).setValues(padded);
+  SpreadsheetApp.flush();
+  console.log('Dashboard repaired: ' + out.length + ' rows');
+}
+
+// Alias — same logic as repairDashboardAnalyticsOnly
+function setupDashboardSheet_() {
+  repairDashboardAnalyticsOnly();
+}
+
+// ==================================================
+// ENTRY POINT: apply to current spreadsheet
+// Вызывать вручную из Apps Script Editor
+// ==================================================
+
+function applyFinalVorsovPatch() {
+  updateCrmStatusValidation_();
+  repairDashboardAnalyticsOnly();
+  console.log('applyFinalVorsovPatch complete');
 }
