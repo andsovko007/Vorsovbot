@@ -347,32 +347,32 @@ function updateCrmStatusValidation_() {
 // ==================================================
 
 function repairDashboardAnalyticsOnly() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const dashSheet = ss.getSheetByName('Дашборд');
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var dashSheet = ss.getSheetByName('Дашборд');
   if (!dashSheet) throw new Error('Лист Дашборд не найден');
 
-  const EXCLUDED_IDS = ['274328371', '289634658'];
+  var EXCLUDED_IDS = ['274328371', '289634658'];
   function isExcluded(tid) { return EXCLUDED_IDS.indexOf(String(tid)) !== -1; }
 
   // ── Events ────────────────────────────────────────────────────────────────
-  const evtSheet = ss.getSheetByName('_История событий');
-  const evtData  = evtSheet ? evtSheet.getDataRange().getValues() : [];
+  var evtSheet = ss.getSheetByName('_История событий');
+  var evtData  = evtSheet ? evtSheet.getDataRange().getValues() : [];
   if (evtData.length > 1) evtData.shift(); else evtData.splice(0);
 
-  const events = evtData.filter(function(r) {
-    const tid = String(r[2] || '');
-    const src = String(r[9] || '');
+  var events = evtData.filter(function(r) {
+    var tid = String(r[2] || '');
+    var src = String(r[9] || '');
     return tid && !isExcluded(tid) && src !== 'test' && src !== 'internal';
   });
 
   // byType[event_type][telegram_id] = true
-  const byType = {};
+  var byType = {};
   // bookingByOrigin[origin][telegram_id] = true
-  const bookingByOrigin = {};
+  var bookingByOrigin = {};
 
   events.forEach(function(r) {
-    const etype = String(r[5] || '');
-    const tid   = String(r[2] || '');
+    var etype = String(r[5] || '');
+    var tid   = String(r[2] || '');
     if (!etype || !tid) return;
     if (!byType[etype]) byType[etype] = {};
     byType[etype][tid] = true;
@@ -389,155 +389,180 @@ function repairDashboardAnalyticsOnly() {
 
   function uniq(t)               { return Object.keys(byType[t] || {}).length; }
   function bookingOriginCount(o) { return Object.keys(bookingByOrigin[o] || {}).length; }
+  // при делении на 0 возвращает 0
+  function pct(num, den)         { return den ? Math.min(100, Math.round(num / den * 100)) + '%' : 0; }
 
   // ── CRM ───────────────────────────────────────────────────────────────────
-  const crmLeads = getCrmLeads_().filter(function(l) { return !isExcluded(l.telegram_id); });
-  const extLeads = crmLeads.filter(function(l) {
+  var crmLeads = getCrmLeads_().filter(function(l) { return !isExcluded(l.telegram_id); });
+  var extLeads = crmLeads.filter(function(l) {
     var src = String(l.source || '');
     return src !== 'test' && src !== 'internal';
   });
 
-  // tid → segment_code / readiness (for cross-referencing booking_clicked)
-  const tidToSeg  = {}, tidToRead = {};
-  extLeads.forEach(function(l) {
-    if (l.segment_code) tidToSeg[String(l.telegram_id)]  = l.segment_code;
-    if (l.readiness)    tidToRead[String(l.telegram_id)] = l.readiness;
-  });
-
   // Status counts
-  const statusCounts = {};
+  var statusCounts = {};
   extLeads.forEach(function(l) {
-    var s = String(l.status || '—');
-    statusCounts[s] = (statusCounts[s] || 0) + 1;
+    var s = String(l.status || '');
+    if (s) statusCounts[s] = (statusCounts[s] || 0) + 1;
   });
 
-  // Segment / readiness: leads count + booking_clicked count
-  const segLeads  = {}, segBooked  = {};
-  const readLeads = {}, readBooked = {};
-
+  // tid → segment_code / readiness (для кросс-матчинга booking_clicked)
+  var tidToSeg = {}, tidToRead = {};
   extLeads.forEach(function(l) {
-    if (l.segment_code) segLeads[l.segment_code]  = (segLeads[l.segment_code]  || 0) + 1;
-    if (l.readiness)    readLeads[l.readiness]     = (readLeads[l.readiness]    || 0) + 1;
+    var tid = String(l.telegram_id);
+    if (l.segment_code) tidToSeg[tid]  = l.segment_code;
+    if (l.readiness)    tidToRead[tid] = l.readiness;
   });
 
-  // booking_clicked cross-referenced with CRM segment & readiness
+  // Сегменты A-D: уникальные лиды, booking_clicked, channel_clicked
+  var SEG_ORDER = ['A', 'B', 'C', 'D'];
+  var segLeads = {}, segBooked = {}, segChannel = {};
+  SEG_ORDER.forEach(function(c) { segLeads[c] = 0; segBooked[c] = {}; segChannel[c] = {}; });
+  extLeads.forEach(function(l) {
+    var code = String(l.segment_code || '');
+    if (segLeads.hasOwnProperty(code)) segLeads[code]++;
+  });
   Object.keys(byType['booking_clicked'] || {}).forEach(function(tid) {
-    var seg  = tidToSeg[tid];
-    var read = tidToRead[tid];
-    if (seg) {
-      if (!segBooked[seg]) segBooked[seg] = {};
-      segBooked[seg][tid] = true;
-    }
-    if (read) {
-      if (!readBooked[read]) readBooked[read] = {};
-      readBooked[read][tid] = true;
-    }
+    var seg = tidToSeg[tid];
+    if (seg && segBooked.hasOwnProperty(seg)) segBooked[seg][tid] = true;
+  });
+  Object.keys(byType['channel_clicked'] || {}).forEach(function(tid) {
+    var seg = tidToSeg[tid];
+    if (seg && segChannel.hasOwnProperty(seg)) segChannel[seg][tid] = true;
   });
 
-  function pct(booked, leads) {
-    if (!leads) return '0%';
-    return Math.min(100, Math.round(booked / leads * 100)) + '%';
-  }
+  // Готовность hot/warm/cold: уникальные лиды + booking_clicked
+  var READ_ORDER = ['hot', 'warm', 'cold'];
+  var readLeads = {hot: 0, warm: 0, cold: 0};
+  var readBooked = {hot: {}, warm: {}, cold: {}};
+  extLeads.forEach(function(l) {
+    var r = String(l.readiness || '');
+    if (readLeads.hasOwnProperty(r)) readLeads[r]++;
+  });
+  Object.keys(byType['booking_clicked'] || {}).forEach(function(tid) {
+    var r = tidToRead[tid];
+    if (r && readBooked.hasOwnProperty(r)) readBooked[r][tid] = true;
+  });
 
-  // Active warmup (v2 only)
-  const activeV2 = crmLeads.filter(function(l) {
+  // CTA unique (booking OR channel)
+  var ctaIds = {};
+  Object.keys(byType['booking_clicked'] || {}).forEach(function(id) { ctaIds[id] = true; });
+  Object.keys(byType['channel_clicked']  || {}).forEach(function(id) { ctaIds[id] = true; });
+  var ctaTotal = Object.keys(ctaIds).length;
+
+  // ── 1. KPI: A4:H4 ────────────────────────────────────────────────────────
+  dashSheet.getRange('A4:H4').setValues([[
+    extLeads.length,
+    uniq('quiz_completed'),
+    ctaTotal,
+    uniq('booking_clicked'),
+    uniq('channel_clicked'),
+    statusCounts['Разбор проведён'] || 0,
+    statusCounts['Бронь']           || 0,
+    statusCounts['Сделка']          || 0
+  ]]);
+
+  // ── 2. Воронка: B8:B15, C8:C15 ───────────────────────────────────────────
+  var funnelVals = [
+    uniq('bot_started'),
+    uniq('quiz_started'),
+    uniq('quiz_completed'),
+    ctaTotal,
+    uniq('booking_clicked'),
+    uniq('channel_clicked'),
+    statusCounts['Записан на разбор'] || 0,
+    statusCounts['Сделка']            || 0
+  ];
+  dashSheet.getRange('B8:B15').setValues(funnelVals.map(function(v) { return [v]; }));
+  dashSheet.getRange('C8:C15').setValues(funnelVals.map(function(v, i) {
+    if (i === 0) return [''];
+    var prev = funnelVals[i - 1];
+    return [prev ? pct(v, prev) : 0];
+  }));
+
+  // ── 3. Статусы: E7, E8:F21 ───────────────────────────────────────────────
+  dashSheet.getRange('E7').setValue('Текущие статусы CRM');
+  dashSheet.getRange('E8:F21').setValues([
+    ['Новый',                statusCounts['Новый']                || 0],
+    ['Начал диагностику',    statusCounts['Начал диагностику']    || 0],
+    ['Прошёл диагностику',   statusCounts['Прошёл диагностику']   || 0],
+    ['В прогреве',           statusCounts['В прогреве']           || 0],
+    ['Перешёл в канал',      statusCounts['Перешёл в канал']      || 0],
+    ['Нажал разбор',         statusCounts['Нажал разбор']         || 0],
+    ['Связаться вручную',    statusCounts['Связаться вручную']    || 0],
+    ['Записан на разбор',    statusCounts['Записан на разбор']    || 0],
+    ['Разбор проведён',      statusCounts['Разбор проведён']      || 0],
+    ['Бронь',                statusCounts['Бронь']                || 0],
+    ['Сделка',               statusCounts['Сделка']               || 0],
+    ['Прогрев остановлен',   statusCounts['Прогрев остановлен']   || 0],
+    ['Прогрев завершён',     statusCounts['Прогрев завершён']     || 0],
+    ['Нецелевой',            statusCounts['Нецелевой']            || 0]
+  ]);
+
+  // ── 4. Сегменты: B24:E27 (A24:A27 не трогаем) ────────────────────────────
+  dashSheet.getRange('B24:E27').setValues(
+    SEG_ORDER.map(function(code) {
+      var leads   = segLeads[code];
+      var booked  = Object.keys(segBooked[code]).length;
+      var channel = Object.keys(segChannel[code]).length;
+      return [leads, booked, channel, pct(booked, leads)];
+    })
+  );
+
+  // ── 5. Готовность: G24:J26 ───────────────────────────────────────────────
+  dashSheet.getRange('G24:J26').setValues(
+    READ_ORDER.map(function(r) {
+      var leads  = readLeads[r];
+      var booked = Object.keys(readBooked[r]).length;
+      return [r, leads, booked, pct(booked, leads)];
+    })
+  );
+
+  // ── 6. Прогрев: A32:D61 (30 строк) ──────────────────────────────────────
+  var noMsgDays = [9, 11, 13, 23, 25];
+  var warmupRows = [['Результат диагностики', uniq('result_sent'), bookingOriginCount('result'), '']];
+  for (var day = 2; day <= 30; day++) {
+    warmupRows.push([
+      'День ' + day,
+      uniq('warmup_day_' + day + '_sent'),
+      bookingOriginCount('day_' + day),
+      noMsgDays.indexOf(day) !== -1 ? 'Нет сообщения по плану' : ''
+    ]);
+  }
+  dashSheet.getRange('A32:D61').setValues(warmupRows);
+
+  // ── 7. Фокус: G32:G36 (G37 не трогаем) ───────────────────────────────────
+  var hotDoneStatuses = ['Нажал разбор', 'Записан на разбор', 'Разбор проведён', 'Бронь', 'Сделка'];
+  var hotActive = extLeads.filter(function(l) {
+    return l.readiness === 'hot' && hotDoneStatuses.indexOf(String(l.status || '')) === -1;
+  }).length;
+
+  var noNextStep = extLeads.filter(function(l) {
+    var st = String(l.status || '');
+    return (st === 'Прошёл диагностику' || st === 'В прогреве') &&
+           !l.last_cta &&
+           !l.warmup_stopped_at;
+  }).length;
+
+  var activeV2 = crmLeads.filter(function(l) {
     return l.source === 'telegram_v2' && l.warmup_started_at && !l.warmup_stopped_at;
   }).length;
 
-  // Hot without followup
-  const hotNoFollowup = extLeads.filter(function(l) {
-    return l.readiness === 'hot' && String(l.hot_followup_sent).toUpperCase() !== 'TRUE';
-  }).length;
-
-  // CTA unique (booking OR channel)
-  const ctaIds = {};
-  Object.keys(byType['booking_clicked'] || {}).forEach(function(id) { ctaIds[id] = true; });
-  Object.keys(byType['channel_clicked']  || {}).forEach(function(id) { ctaIds[id] = true; });
-
-  // ── Output ────────────────────────────────────────────────────────────────
-  var out = [];
-
-  // Основная воронка
-  out.push(['ОСНОВНАЯ ВОРОНКА', 'Уникальных']);
-  out.push(['Зашли (bot_started)',       uniq('bot_started')]);
-  out.push(['Начали (quiz_started)',      uniq('quiz_started')]);
-  out.push(['Прошли (quiz_completed)',    uniq('quiz_completed')]);
-  out.push(['CTA (booking или channel)',  Object.keys(ctaIds).length]);
-  out.push(['Разбор (booking_clicked)',   uniq('booking_clicked')]);
-  out.push(['', '']);
-
-  // Текущие статусы CRM
-  out.push(['ТЕКУЩИЕ СТАТУСЫ CRM', 'Лидов']);
-  var allStatuses = [
-    'Новый','Начал диагностику','Прошёл диагностику','В прогреве',
-    'Перешёл в канал','Нажал разбор','Связаться вручную',
-    'Записан на разбор','Разбор проведён','Бронь','Сделка',
-    'Прогрев остановлен','Прогрев завершён','Нецелевой'
-  ];
-  allStatuses.forEach(function(s) { out.push([s, statusCounts[s] || 0]); });
-  out.push(['', '']);
-
-  // Сегменты — лиды + нажали разбор + конверсия внутри сегмента
-  out.push(['СЕГМЕНТЫ', 'Лидов', 'Нажали разбор', 'Конверсия']);
-  Object.keys(segLeads).sort().forEach(function(code) {
-    var leads  = segLeads[code];
-    var booked = Object.keys(segBooked[code] || {}).length;
-    out.push(['Сегмент ' + code, leads, booked, pct(booked, leads)]);
+  var topSeg = SEG_ORDER[0];
+  SEG_ORDER.forEach(function(code) {
+    if (segLeads[code] > segLeads[topSeg]) topSeg = code;
   });
-  out.push(['', '']);
 
-  // Готовность — лиды + нажали разбор + конверсия внутри готовности
-  out.push(['ГОТОВНОСТЬ', 'Лидов', 'Нажали разбор', 'Конверсия']);
-  Object.keys(readLeads).forEach(function(r) {
-    var leads  = readLeads[r];
-    var booked = Object.keys(readBooked[r] || {}).length;
-    out.push([r, leads, booked, pct(booked, leads)]);
-  });
-  out.push(['', '']);
+  dashSheet.getRange('G32:G36').setValues([
+    [hotActive],
+    [uniq('booking_clicked')],
+    [noNextStep],
+    [activeV2],
+    ['Сегмент ' + topSeg + ' (' + segLeads[topSeg] + ')']
+  ]);
 
-  // Прогрев по дням — все дни 1–30
-  var noMsgDays = [9, 11, 13, 23, 25];
-  out.push(['ПРОГРЕВ ПО ДНЯМ', 'Уникальных', 'Примечание']);
-  out.push(['День 1', uniq('result_sent'), '']);
-  for (var n = 2; n <= 30; n++) {
-    var note = noMsgDays.indexOf(n) !== -1 ? 'Нет сообщения по плану' : '';
-    out.push(['День ' + n, uniq('warmup_day_' + n + '_sent'), note]);
-  }
-  out.push(['', '']);
-
-  // Нажали разбор по дню
-  out.push(['НАЖАЛИ РАЗБОР ПО ДНЮ', 'Уникальных']);
-  out.push(['result (после диагностики)', bookingOriginCount('result')]);
-  out.push(['hot_1',                      bookingOriginCount('hot_1')]);
-  for (var d = 2; d <= 30; d++) {
-    out.push(['day_' + d, bookingOriginCount('day_' + d)]);
-  }
-  out.push(['', '']);
-
-  // Фокус на сегодня
-  var noNextStep = extLeads.filter(function(l) {
-    return !l.warmup_started_at && l.status === 'Прошёл диагностику';
-  }).length;
-  var topSeg = Object.keys(segLeads).sort(function(a, b) { return segLeads[b] - segLeads[a]; })[0];
-
-  out.push(['ФОКУС НА СЕГОДНЯ', '']);
-  out.push(['Горячие без разбора',             hotNoFollowup]);
-  out.push(['Нажали разбор (booking_clicked)',  uniq('booking_clicked')]);
-  out.push(['Без следующего шага',              noNextStep]);
-  out.push(['В активном прогреве (v2)',          activeV2]);
-  out.push(['Самый частый сегмент', topSeg ? 'Сегмент ' + topSeg + ' (' + segLeads[topSeg] + ')' : '—']);
-
-  // ── Write ─────────────────────────────────────────────────────────────────
-  dashSheet.clearContents();
-  var maxCols = 0;
-  out.forEach(function(r) { if (r.length > maxCols) maxCols = r.length; });
-  var padded = out.map(function(r) {
-    while (r.length < maxCols) r.push('');
-    return r;
-  });
-  dashSheet.getRange(1, 1, padded.length, maxCols).setValues(padded);
   SpreadsheetApp.flush();
-  console.log('Dashboard repaired: ' + out.length + ' rows');
+  console.log('Dashboard updated: ' + new Date().toISOString());
 }
 
 // ==================================================
