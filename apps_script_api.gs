@@ -509,11 +509,6 @@ function repairDashboardAnalyticsOnly() {
   console.log('Dashboard repaired: ' + out.length + ' rows');
 }
 
-// Alias — same logic as repairDashboardAnalyticsOnly
-function setupDashboardSheet_() {
-  repairDashboardAnalyticsOnly();
-}
-
 // ==================================================
 // ENTRY POINT: apply to current spreadsheet
 // Вызывать вручную из Apps Script Editor
