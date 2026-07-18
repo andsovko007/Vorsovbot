@@ -11,7 +11,7 @@
  * SHEETS_API_SECRET = такой же секрет, как ниже
  */
 
-const VORSOV_API_SECRET = 'CHANGE_ME_SECRET';
+const VORSOV_API_SECRET = 'vorsov_secret_2026';
 
 function doGet(e) {
   try {
