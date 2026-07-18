@@ -146,20 +146,31 @@ function getCrmLeads_() {
     }));
 }
 
-const STATUS_ORDER_ = [
-  'Новый', 'Начал диагностику', 'Прошёл диагностику', 'В прогреве',
-  'Перешёл в канал', 'Нажал разбор', 'Связаться вручную',
-  'Записан на разбор', 'Разбор проведён', 'Бронь', 'Сделка'
-];
-const LOCKED_STATUSES_ = ['Сделка', 'Нецелевой', 'Прогрев остановлен', 'Прогрев завершён'];
+var STATUS_RANK_ = {
+  'Новый':               0,
+  'Начал диагностику':   1,
+  'Прошёл диагностику':  2,
+  'В прогреве':          3,
+  'Прогрев остановлен':  3,
+  'Прогрев завершён':    3,
+  'Перешёл в канал':     4,
+  'Связаться вручную':   4,
+  'Нажал разбор':        5,
+  'Записан на разбор':   6,
+  'Разбор проведён':     7,
+  'Бронь':               8,
+  'Сделка':              9,
+  'Нецелевой':           9
+};
+var LOCKED_STATUSES_ = ['Сделка', 'Нецелевой'];
 
 function safeStatus_(newStatus, existingStatus) {
   if (!newStatus) return existingStatus || '';
   if (!existingStatus) return newStatus;
   if (LOCKED_STATUSES_.indexOf(existingStatus) !== -1) return existingStatus;
-  const newIdx = STATUS_ORDER_.indexOf(newStatus);
-  const existIdx = STATUS_ORDER_.indexOf(existingStatus);
-  if (newIdx !== -1 && existIdx !== -1 && newIdx < existIdx) return existingStatus;
+  var newRank   = STATUS_RANK_.hasOwnProperty(newStatus)      ? STATUS_RANK_[newStatus]      : -1;
+  var existRank = STATUS_RANK_.hasOwnProperty(existingStatus) ? STATUS_RANK_[existingStatus] : -1;
+  if (newRank !== -1 && existRank !== -1 && newRank < existRank) return existingStatus;
   return newStatus;
 }
 
@@ -305,8 +316,7 @@ function updateCrmStatusValidation_() {
     'Бронь', 'Сделка', 'Прогрев остановлен', 'Прогрев завершён', 'Нецелевой'
   ];
 
-  const lastRow = Math.max(sheet.getLastRow(), 2);
-  const statusRange = sheet.getRange(2, 20, lastRow - 1, 1); // col T
+  const statusRange = sheet.getRange('T2:T1000');
 
   const rule = SpreadsheetApp.newDataValidation()
     .requireValueInList(VALID_STATUSES, true)
@@ -314,7 +324,7 @@ function updateCrmStatusValidation_() {
     .build();
   statusRange.setDataValidation(rule);
 
-  const fmtRange = sheet.getRange(2, 1, lastRow - 1, 27);
+  const fmtRange = sheet.getRange('A2:AA1000');
   const colorMap = {
     'Сделка':             '#0f9d58',
     'Бронь':              '#34a853',
@@ -389,11 +399,15 @@ function repairDashboardAnalyticsOnly() {
 
   function uniq(t)               { return Object.keys(byType[t] || {}).length; }
   function bookingOriginCount(o) { return Object.keys(bookingByOrigin[o] || {}).length; }
-  // при делении на 0 возвращает 0
-  function pct(num, den)         { return den ? Math.min(100, Math.round(num / den * 100)) + '%' : 0; }
+  // возвращает дробь 0..1; Sheets отображает как % при формате 0.00%
+  function pct(num, den)         { return den ? Math.min(1, num / den) : 0; }
 
-  // ── CRM ───────────────────────────────────────────────────────────────────
-  var crmLeads = getCrmLeads_().filter(function(l) { return !isExcluded(l.telegram_id); });
+  // ── CRM — дедупликация по telegram_id (последняя строка побеждает) ────────
+  var rawLeads = getCrmLeads_();
+  var leadMap = {};
+  rawLeads.forEach(function(l) { leadMap[String(l.telegram_id)] = l; });
+  var allLeads = Object.keys(leadMap).map(function(tid) { return leadMap[tid]; });
+  var crmLeads = allLeads.filter(function(l) { return !isExcluded(l.telegram_id); });
   var extLeads = crmLeads.filter(function(l) {
     var src = String(l.source || '');
     return src !== 'test' && src !== 'internal';
@@ -469,9 +483,9 @@ function repairDashboardAnalyticsOnly() {
     uniq('quiz_completed'),
     ctaTotal,
     uniq('booking_clicked'),
-    uniq('channel_clicked'),
-    statusCounts['Записан на разбор'] || 0,
-    statusCounts['Сделка']            || 0
+    statusCounts['Разбор проведён'] || 0,
+    statusCounts['Бронь']           || 0,
+    statusCounts['Сделка']          || 0
   ];
   dashSheet.getRange('B8:B15').setValues(funnelVals.map(function(v) { return [v]; }));
   dashSheet.getRange('C8:C15').setValues(funnelVals.map(function(v, i) {
@@ -479,6 +493,7 @@ function repairDashboardAnalyticsOnly() {
     var prev = funnelVals[i - 1];
     return [prev ? pct(v, prev) : 0];
   }));
+  dashSheet.getRange('C9:C15').setNumberFormat('0.00%');
 
   // ── 3. Статусы: E7, E8:F21 ───────────────────────────────────────────────
   dashSheet.getRange('E7').setValue('Текущие статусы CRM');
@@ -508,6 +523,7 @@ function repairDashboardAnalyticsOnly() {
       return [leads, booked, channel, pct(booked, leads)];
     })
   );
+  dashSheet.getRange('E24:E27').setNumberFormat('0.00%');
 
   // ── 5. Готовность: G24:J26 ───────────────────────────────────────────────
   dashSheet.getRange('G24:J26').setValues(
@@ -517,6 +533,7 @@ function repairDashboardAnalyticsOnly() {
       return [r, leads, booked, pct(booked, leads)];
     })
   );
+  dashSheet.getRange('J24:J26').setNumberFormat('0.00%');
 
   // ── 6. Прогрев: A32:D61 (30 строк) ──────────────────────────────────────
   var noMsgDays = [9, 11, 13, 23, 25];
@@ -552,13 +569,14 @@ function repairDashboardAnalyticsOnly() {
   SEG_ORDER.forEach(function(code) {
     if (segLeads[code] > segLeads[topSeg]) topSeg = code;
   });
+  var topSegLabel = segLeads[topSeg] > 0 ? 'Сегмент ' + topSeg + ' (' + segLeads[topSeg] + ')' : '—';
 
   dashSheet.getRange('G32:G36').setValues([
     [hotActive],
     [uniq('booking_clicked')],
     [noNextStep],
     [activeV2],
-    ['Сегмент ' + topSeg + ' (' + segLeads[topSeg] + ')']
+    [topSegLabel]
   ]);
 
   SpreadsheetApp.flush();

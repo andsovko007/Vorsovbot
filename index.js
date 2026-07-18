@@ -220,7 +220,7 @@ function getUser(ctx) {
   };
 }
 
-async function logEvent(user, event_type, extra = {}) {
+async function logEvent(user, event_type, extra = {}, strict = false) {
   try {
     await apiPost('appendEvent', {
       event_id: `${event_type}_${user.telegram_id}_${Date.now()}`,
@@ -236,10 +236,11 @@ async function logEvent(user, event_type, extra = {}) {
     });
   } catch (e) {
     console.error('appendEvent failed:', e.message);
+    if (strict) throw e;
   }
 }
 
-async function upsertLead(user, data = {}) {
+async function upsertLead(user, data = {}, strict = false) {
   try {
     await apiPost('upsertLead', {
       telegram_id: user.telegram_id,
@@ -250,6 +251,7 @@ async function upsertLead(user, data = {}) {
     });
   } catch (e) {
     console.error('upsertLead failed:', e.message);
+    if (strict) throw e;
   }
 }
 
@@ -439,18 +441,14 @@ bot.callbackQuery(/^cta:/, async (ctx) => {
   const src = getSource(user.telegram_id);
 
   if (ctaType === 'booking') {
-    background('cta_booking', (async () => {
-      await logEvent(user, 'booking_clicked', { source: src, payload: { origin } });
-      await upsertLead(user, { last_cta: 'booking', status: CRM_STATUS.clicked_booking, source: src });
-    })());
+    await logEvent(user, 'booking_clicked', { source: src, payload: { origin } }, true);
+    await upsertLead(user, { last_cta: 'booking', status: CRM_STATUS.clicked_booking, source: src }, true);
     await ctx.reply('Выберите удобное время:', {
       reply_markup: new InlineKeyboard().url('Записаться на разбор', content.settings.booking_url),
     });
   } else if (ctaType === 'channel') {
-    background('cta_channel', (async () => {
-      await logEvent(user, 'channel_clicked', { source: src, payload: { origin } });
-      await upsertLead(user, { last_cta: 'channel', status: CRM_STATUS.clicked_channel, source: src });
-    })());
+    await logEvent(user, 'channel_clicked', { source: src, payload: { origin } }, true);
+    await upsertLead(user, { last_cta: 'channel', status: CRM_STATUS.clicked_channel, source: src }, true);
     await ctx.reply('Переходите в канал:', {
       reply_markup: new InlineKeyboard().url('Открыть канал', content.settings.channel_url),
     });
@@ -723,14 +721,14 @@ async function runWarmupTick() {
 
         const nextDay = warmupDays.find(d => d > day);
 
-        await logEvent(leadUser, `warmup_day_${day}_sent`, { source: 'telegram_v2', payload: { origin: `day_${day}` } });
-
         if (!nextDay) {
-          await upsertLead(leadUser, { warmup_stopped_at: new Date().toISOString(), status: CRM_STATUS.warmup_completed });
+          await upsertLead(leadUser, { warmup_stopped_at: new Date().toISOString(), status: CRM_STATUS.warmup_completed }, true);
+          await logEvent(leadUser, `warmup_day_${day}_sent`, { source: 'telegram_v2', payload: { origin: `day_${day}` } }, true);
           await logEvent(leadUser, 'warmup_completed', { source: 'telegram_v2' });
           console.log(`Warmup completed after day ${day}: ${lead.telegram_id}`);
         } else {
-          await upsertLead(leadUser, { current_warmup_day: nextDay, status: CRM_STATUS.in_warmup });
+          await upsertLead(leadUser, { current_warmup_day: nextDay, status: CRM_STATUS.in_warmup }, true);
+          await logEvent(leadUser, `warmup_day_${day}_sent`, { source: 'telegram_v2', payload: { origin: `day_${day}` } }, true);
           console.log(`Warmup sent: ${lead.telegram_id} day=${day} -> next=${nextDay}`);
         }
       } catch (sendErr) {
@@ -783,8 +781,8 @@ async function runHotFollowupTick() {
         await sendHtml(bot, Number(lead.telegram_id), String(row.text), actionKeyboard([
           { text: row.button_1, type: row.type_1 },
         ], content.settings, 'hot_1'));
-        await upsertLead(leadUser, { hot_followup_sent: true, source: 'telegram_v2' });
-        await logEvent(leadUser, 'hot_followup_sent', { source: 'telegram_v2', payload: { origin: 'hot_1' } });
+        await upsertLead(leadUser, { hot_followup_sent: true, source: 'telegram_v2' }, true);
+        await logEvent(leadUser, 'hot_followup_sent', { source: 'telegram_v2', payload: { origin: 'hot_1' } }, true);
         console.log(`Hot followup sent: ${lead.telegram_id}`);
       } catch (sendErr) {
         console.error(`Hot followup failed: ${lead.telegram_id}:`, sendErr.message);
