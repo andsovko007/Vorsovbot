@@ -33,8 +33,16 @@ const CRM_STATUS = {
   reservation: 'Бронь',
   deal: 'Сделка',
   warmup_stopped: 'Прогрев остановлен',
+  warmup_completed: 'Прогрев завершён',
   not_relevant: 'Нецелевой',
 };
+
+const BOT_SOURCE = 'telegram_v2';
+const INTERNAL_TELEGRAM_IDS = new Set(['274328371', '289634658']);
+
+function getSource(telegramId) {
+  return INTERNAL_TELEGRAM_IDS.has(String(telegramId)) ? 'internal' : BOT_SOURCE;
+}
 
 function isAdmin(ctx) {
   return String(ctx.from?.id || '').trim() === String(ENV.ADMIN_CHAT_ID || '').trim();
@@ -169,16 +177,16 @@ function keyboardForOptions(questionId, options) {
   return kb;
 }
 
-function actionKeyboard(buttons, settings) {
+function actionKeyboard(buttons, settings, origin = 'unknown') {
   const kb = new InlineKeyboard();
 
   for (const b of buttons) {
     if (!b.text || !b.type) continue;
 
     if (b.type === 'booking') {
-      kb.url(b.text, settings.booking_url);
+      kb.text(b.text, `cta:booking:${origin}`);
     } else if (b.type === 'channel') {
-      kb.url(b.text, settings.channel_url);
+      kb.text(b.text, `cta:channel:${origin}`);
     } else if (b.type === 'restart') {
       kb.text(b.text, callback('restart', '1'));
     } else if (b.type === 'reviews') {
@@ -212,7 +220,7 @@ function getUser(ctx) {
   };
 }
 
-async function logEvent(user, event_type, extra = {}) {
+async function logEvent(user, event_type, extra = {}, strict = false) {
   try {
     await apiPost('appendEvent', {
       event_id: `${event_type}_${user.telegram_id}_${Date.now()}`,
@@ -228,10 +236,11 @@ async function logEvent(user, event_type, extra = {}) {
     });
   } catch (e) {
     console.error('appendEvent failed:', e.message);
+    if (strict) throw e;
   }
 }
 
-async function upsertLead(user, data = {}) {
+async function upsertLead(user, data = {}, strict = false) {
   try {
     await apiPost('upsertLead', {
       telegram_id: user.telegram_id,
@@ -242,6 +251,7 @@ async function upsertLead(user, data = {}) {
     });
   } catch (e) {
     console.error('upsertLead failed:', e.message);
+    if (strict) throw e;
   }
 }
 
@@ -313,7 +323,7 @@ async function finishQuiz(ctx, session) {
     { text: cta.button_2, type: cta.type_2 },
   ].filter(b => b.text);
 
-  await sendHtml(ctx, String(segment.text), actionKeyboard(buttons, content.settings));
+  await sendHtml(ctx, String(segment.text), actionKeyboard(buttons, content.settings, 'result'));
 
   const answers = {
     q1: session.answers.q1 || '',
@@ -333,6 +343,7 @@ async function finishQuiz(ctx, session) {
     goal_tag: tags.goal_tag,
     payment_tag: tags.payment_tag,
     last_cta: '',
+    source: getSource(user.telegram_id),
     status: CRM_STATUS.quiz_completed,
     diagnosis_completed_at: new Date().toISOString(),
     warmup_started_at: new Date().toISOString(),
@@ -340,10 +351,11 @@ async function finishQuiz(ctx, session) {
     hot_followup_sent: false,
   };
 
+  const finishSrc = getSource(user.telegram_id);
   await upsertLead(user, leadData);
   await appendDiagnosis(user, { ...answers, segment_code, segment_name, readiness, ...tags });
-  await logEvent(user, 'quiz_completed', { segment_code, readiness });
-  await logEvent(user, 'result_sent', { segment_code, readiness });
+  await logEvent(user, 'quiz_completed', { segment_code, readiness, source: finishSrc });
+  await logEvent(user, 'result_sent', { segment_code, readiness, source: finishSrc });
 
   if (ENV.ADMIN_CHAT_ID) {
     const managerHint = readiness === 'hot'
@@ -392,8 +404,9 @@ async function startQuiz(ctx) {
 
   await askQuestion(ctx, session);
 
-  background('quiz_started_upsert', upsertLead(user, { status: CRM_STATUS.quiz_started }));
-  background('quiz_started_event', logEvent(user, 'quiz_started'));
+  const startSrc = getSource(user.telegram_id);
+  background('quiz_started_upsert', upsertLead(user, { status: CRM_STATUS.quiz_started, source: startSrc }));
+  background('quiz_started_event', logEvent(user, 'quiz_started', { source: startSrc }));
 }
 
 bot.command('start', async (ctx) => {
@@ -403,8 +416,9 @@ bot.command('start', async (ctx) => {
   const kb = new InlineKeyboard().text(content.start.button_1 || 'Начать', callback('start_quiz', '1'));
   await sendHtml(ctx, String(content.start.text), kb);
 
-  background('bot_started_upsert', upsertLead(user, { status: CRM_STATUS.new }));
-  background('bot_started_event', logEvent(user, 'bot_started'));
+  const startCmdSrc = getSource(user.telegram_id);
+  background('bot_started_upsert', upsertLead(user, { status: CRM_STATUS.new, source: startCmdSrc }));
+  background('bot_started_event', logEvent(user, 'bot_started', { source: startCmdSrc }));
 });
 
 bot.callbackQuery(/^start_quiz:/, async (ctx) => {
@@ -415,6 +429,30 @@ bot.callbackQuery(/^start_quiz:/, async (ctx) => {
 bot.callbackQuery(/^restart:/, async (ctx) => {
   await ctx.answerCallbackQuery();
   await startQuiz(ctx);
+});
+
+bot.callbackQuery(/^cta:/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const content = await loadContent();
+  const user = getUser(ctx);
+  const parts = ctx.callbackQuery.data.split(':');
+  const ctaType = parts[1];
+  const origin = parts.slice(2).join(':');
+  const src = getSource(user.telegram_id);
+
+  if (ctaType === 'booking') {
+    await logEvent(user, 'booking_clicked', { source: src, payload: { origin } }, true);
+    await upsertLead(user, { last_cta: 'booking', status: CRM_STATUS.clicked_booking, source: src }, true);
+    await ctx.reply('Выберите удобное время:', {
+      reply_markup: new InlineKeyboard().url('Записаться на разбор', content.settings.booking_url),
+    });
+  } else if (ctaType === 'channel') {
+    await logEvent(user, 'channel_clicked', { source: src, payload: { origin } }, true);
+    await upsertLead(user, { last_cta: 'channel', status: CRM_STATUS.clicked_channel, source: src }, true);
+    await ctx.reply('Переходите в канал:', {
+      reply_markup: new InlineKeyboard().url('Открыть канал', content.settings.channel_url),
+    });
+  }
 });
 
 bot.callbackQuery(/^answer:/, async (ctx) => {
@@ -443,7 +481,7 @@ bot.callbackQuery(/^answer:/, async (ctx) => {
   session.selectedOptions[q.id] = opt;
   session.index += 1;
 
-  background('question_answered', logEvent(user, 'question_answered', { payload: { question_id: q.id, option_id: optionId, text: opt.text } }));
+  background('question_answered', logEvent(user, 'question_answered', { source: getSource(user.telegram_id), payload: { question_id: q.id, option_id: optionId, text: opt.text } }));
 
   if (session.index >= content.questions.length) {
     await finishQuiz(ctx, session);
@@ -458,15 +496,16 @@ bot.on('message:text', async (ctx, next) => {
 
   const user = getUser(ctx);
 
+  const txtSrc = getSource(user.telegram_id);
   if (['стоп', 'stop', 'остановить', 'не писать'].includes(text.trim().toLowerCase())) {
-    await upsertLead(user, { status: CRM_STATUS.warmup_stopped, warmup_stopped_at: new Date().toISOString() });
-    await logEvent(user, 'warmup_stopped');
+    await upsertLead(user, { status: CRM_STATUS.warmup_stopped, warmup_stopped_at: new Date().toISOString(), source: txtSrc });
+    await logEvent(user, 'warmup_stopped', { source: txtSrc });
     await ctx.reply('Ок, прогрев остановлен.');
     return;
   }
 
-  await logEvent(user, 'text_message_received', { payload: { text } });
-  await upsertLead(user, { status: CRM_STATUS.manual_contact_needed });
+  await logEvent(user, 'text_message_received', { source: txtSrc, payload: { text } });
+  await upsertLead(user, { status: CRM_STATUS.manual_contact_needed, source: txtSrc });
 
   if (ENV.ADMIN_CHAT_ID) {
     await bot.api.sendMessage(ENV.ADMIN_CHAT_ID, `Пользователь написал в бот:\n${user.name} @${user.username || '-'}\n\n${text}`);
@@ -522,7 +561,7 @@ bot.command('admin_preview_warmup', async (ctx) => {
     await sendHtml(ctx, `<b>${row.id}</b>\n\n${row.text}`, actionKeyboard([
       { text: row.button_1, type: row.type_1 },
       { text: row.button_2, type: row.type_2 },
-    ], content.settings));
+    ], content.settings, row.id));
     await delay(ENV.WARMUP_FAST_DELAY_MS);
   }
 });
@@ -557,7 +596,7 @@ bot.command('admin_preview_warmup_day', async (ctx) => {
   await sendHtml(ctx, row.text, actionKeyboard([
     { text: row.button_1, type: row.type_1 },
     { text: row.button_2, type: row.type_2 },
-  ], content.settings));
+  ], content.settings, row.id));
 });
 
 bot.command('test_upsert_me', async (ctx) => {
@@ -591,7 +630,7 @@ bot.command('test_user', async (ctx) => {
   await sendHtml(ctx, seg.text, actionKeyboard([
     { text: cta.button_1, type: cta.type_1 },
     { text: cta.button_2, type: cta.type_2 },
-  ], content.settings));
+  ], content.settings, 'test'));
 
   await ctx.reply(`Тест: segment=${segment}, readiness=${readiness}`);
 });
@@ -606,7 +645,7 @@ bot.command('test_warmup_fast', async (ctx) => {
     await sendHtml(ctx, `<b>${row.id}</b>\n\n${row.text}`, actionKeyboard([
       { text: row.button_1, type: row.type_1 },
       { text: row.button_2, type: row.type_2 },
-    ], content.settings));
+    ], content.settings, row.id));
     await delay(ENV.WARMUP_FAST_DELAY_MS);
   }
 });
@@ -615,7 +654,7 @@ bot.command('test_hot_followup', async (ctx) => {
   if (!isAdmin(ctx) || !ENV.ALLOW_TEST_COMMANDS) return;
   const content = await loadContent(true);
   const row = content.warmup.find(r => r.id === 'hot_1');
-  await sendHtml(ctx, row.text, actionKeyboard([{ text: row.button_1, type: row.type_1 }], content.settings));
+  await sendHtml(ctx, row.text, actionKeyboard([{ text: row.button_1, type: row.type_1 }], content.settings, 'hot_1'));
 });
 
 function delay(ms) {
@@ -631,8 +670,20 @@ async function runWarmupTick() {
     const content = await loadContent();
     const leads = await getCrmLeads();
 
-    const active = leads.filter(l => l.warmup_started_at && !l.warmup_stopped_at);
-    console.log(`Warmup tick: ${active.length} active leads`);
+    // Sorted list of active warmup days (N >= 2) from content
+    const warmupDays = content.warmup
+      .filter(r => /^day_\d+$/.test(r.id))
+      .map(r => Number(r.id.replace('day_', '')))
+      .filter(n => n >= 2)
+      .sort((a, b) => a - b);
+
+    // Only telegram_v2 leads — old source=telegram leads are never touched
+    const active = leads.filter(l =>
+      l.source === 'telegram_v2' &&
+      l.warmup_started_at &&
+      !l.warmup_stopped_at
+    );
+    console.log(`Warmup tick: ${active.length} active v2 leads`);
 
     for (const lead of active) {
       const day = Math.max(2, Number(lead.current_warmup_day || 2));
@@ -641,14 +692,24 @@ async function runWarmupTick() {
       );
       if (Date.now() < sendAfter.getTime()) continue;
 
+      const leadUser = {
+        telegram_id: String(lead.telegram_id),
+        username: lead.username || '',
+        name: lead.name || '',
+      };
       const row = content.warmup.find(r => r.id === `day_${day}`);
 
       if (!row) {
-        await upsertLead(
-          { telegram_id: String(lead.telegram_id), username: '', name: '' },
-          { warmup_stopped_at: new Date().toISOString(), status: CRM_STATUS.warmup_stopped }
-        );
-        console.log(`Warmup complete: ${lead.telegram_id}`);
+        // Day missing in content — skip to next existing day, don't stop warmup
+        const nextDay = warmupDays.find(d => d > day);
+        if (!nextDay) {
+          await upsertLead(leadUser, { warmup_stopped_at: new Date().toISOString(), status: CRM_STATUS.warmup_completed });
+          await logEvent(leadUser, 'warmup_completed', { source: 'telegram_v2' });
+          console.log(`Warmup completed: ${lead.telegram_id}`);
+        } else {
+          await upsertLead(leadUser, { current_warmup_day: nextDay });
+          console.log(`Warmup skip day ${day} -> ${nextDay}: ${lead.telegram_id}`);
+        }
         continue;
       }
 
@@ -656,16 +717,31 @@ async function runWarmupTick() {
         await sendHtml(bot, Number(lead.telegram_id), String(row.text), actionKeyboard([
           { text: row.button_1, type: row.type_1 },
           { text: row.button_2, type: row.type_2 },
-        ], content.settings));
+        ], content.settings, row.id));
 
-        await upsertLead(
-          { telegram_id: String(lead.telegram_id), username: '', name: '' },
-          { current_warmup_day: day + 1, status: CRM_STATUS.in_warmup }
-        );
+        const nextDay = warmupDays.find(d => d > day);
 
-        console.log(`Warmup sent: ${lead.telegram_id} day=${day}`);
+        if (!nextDay) {
+          await upsertLead(leadUser, { warmup_stopped_at: new Date().toISOString(), status: CRM_STATUS.warmup_completed }, true);
+          await logEvent(leadUser, `warmup_day_${day}_sent`, { source: 'telegram_v2', payload: { origin: `day_${day}` } }, true);
+          await logEvent(leadUser, 'warmup_completed', { source: 'telegram_v2' });
+          console.log(`Warmup completed after day ${day}: ${lead.telegram_id}`);
+        } else {
+          await upsertLead(leadUser, { current_warmup_day: nextDay, status: CRM_STATUS.in_warmup }, true);
+          await logEvent(leadUser, `warmup_day_${day}_sent`, { source: 'telegram_v2', payload: { origin: `day_${day}` } }, true);
+          console.log(`Warmup sent: ${lead.telegram_id} day=${day} -> next=${nextDay}`);
+        }
       } catch (sendErr) {
-        console.error(`Warmup send failed for ${lead.telegram_id}:`, sendErr.message);
+        const errMsg = sendErr.message || '';
+        const isBlocked = /blocked|chat not found|403|deactivated|kicked/i.test(errMsg);
+        if (isBlocked) {
+          await upsertLead(leadUser, { warmup_stopped_at: new Date().toISOString(), status: CRM_STATUS.warmup_stopped });
+          await logEvent(leadUser, 'warmup_delivery_failed', { source: 'telegram_v2', payload: { error: errMsg } });
+          console.error(`Warmup blocked: ${lead.telegram_id}:`, errMsg);
+        } else {
+          // Temporary error — don't advance day, don't stop warmup
+          console.error(`Warmup temp error: ${lead.telegram_id}:`, errMsg);
+        }
       }
     }
   } catch (e) {
@@ -674,6 +750,50 @@ async function runWarmupTick() {
 }
 
 cron.schedule('0 * * * *', runWarmupTick);
+
+async function runHotFollowupTick() {
+  try {
+    const content = await loadContent();
+    const leads = await getCrmLeads();
+    const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+
+    const eligible = leads.filter(l =>
+      l.source === 'telegram_v2' &&
+      l.readiness === 'hot' &&
+      ['A', 'B', 'C'].includes(String(l.segment_code)) &&
+      l.diagnosis_completed_at &&
+      new Date(l.diagnosis_completed_at).getTime() <= twoHoursAgo &&
+      String(l.hot_followup_sent).toUpperCase() !== 'TRUE' &&
+      !l.warmup_stopped_at
+    );
+
+    console.log(`Hot followup tick: ${eligible.length} eligible`);
+    const row = content.warmup.find(r => r.id === 'hot_1');
+    if (!row) { console.log('hot_1 not found in content'); return; }
+
+    for (const lead of eligible) {
+      const leadUser = {
+        telegram_id: String(lead.telegram_id),
+        username: lead.username || '',
+        name: lead.name || '',
+      };
+      try {
+        await sendHtml(bot, Number(lead.telegram_id), String(row.text), actionKeyboard([
+          { text: row.button_1, type: row.type_1 },
+        ], content.settings, 'hot_1'));
+        await upsertLead(leadUser, { hot_followup_sent: true, source: 'telegram_v2' }, true);
+        await logEvent(leadUser, 'hot_followup_sent', { source: 'telegram_v2', payload: { origin: 'hot_1' } }, true);
+        console.log(`Hot followup sent: ${lead.telegram_id}`);
+      } catch (sendErr) {
+        console.error(`Hot followup failed: ${lead.telegram_id}:`, sendErr.message);
+      }
+    }
+  } catch (e) {
+    console.error('Hot followup tick error:', e.message);
+  }
+}
+
+cron.schedule('*/10 * * * *', runHotFollowupTick);
 
 bot.catch((err) => {
   console.error('Bot error:', err);
