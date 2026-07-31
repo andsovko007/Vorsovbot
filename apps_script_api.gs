@@ -207,8 +207,26 @@ function upsertLead_(p) {
       return '';
     };
 
-    // source: для существующей строки НИКОГДА не перезаписываем
-    const sourceValue = existing ? (e[5] || p.source || 'telegram') : (p.source || 'telegram');
+    const existingSource = String(e[5] || '');
+    const incomingSource = String(p.source || '');
+
+    const completedDiagnosisNow = Boolean(
+      p.diagnosis_completed_at &&
+      p.warmup_started_at
+    );
+
+    const sourceValue = existing
+      ? (
+          existingSource === 'internal' || existingSource === 'test'
+            ? existingSource
+            : (
+                incomingSource === 'telegram_v2' &&
+                completedDiagnosisNow
+                  ? 'telegram_v2'
+                  : (existingSource || incomingSource || 'telegram')
+              )
+        )
+      : (incomingSource || 'telegram');
 
     // status: защита от отката и блокировка финальных статусов
     const statusValue = safeStatus_(p.status, existing ? String(e[19] || '') : '');
@@ -592,4 +610,23 @@ function applyFinalVorsovPatch() {
   updateCrmStatusValidation_();
   repairDashboardAnalyticsOnly();
   console.log('applyFinalVorsovPatch complete');
+}
+
+function installDashboardAutoRefresh() {
+  var handler = 'repairDashboardAnalyticsOnly';
+
+  ScriptApp.getProjectTriggers().forEach(function(trigger) {
+    if (trigger.getHandlerFunction() === handler) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+  ScriptApp.newTrigger(handler)
+    .timeBased()
+    .everyMinutes(10)
+    .create();
+
+  repairDashboardAnalyticsOnly();
+
+  console.log('Dashboard auto-refresh installed');
 }

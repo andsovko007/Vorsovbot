@@ -39,6 +39,7 @@ const CRM_STATUS = {
 
 const BOT_SOURCE = 'telegram_v2';
 const INTERNAL_TELEGRAM_IDS = new Set(['274328371', '289634658']);
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 function getSource(telegramId) {
   return INTERNAL_TELEGRAM_IDS.has(String(telegramId)) ? 'internal' : BOT_SOURCE;
@@ -48,13 +49,31 @@ function isAdmin(ctx) {
   return String(ctx.from?.id || '').trim() === String(ENV.ADMIN_CHAT_ID || '').trim();
 }
 
-async function apiGet(action) {
+async function apiGet(action, attempt = 1) {
   const url = new URL(ENV.SHEETS_WEBAPP_URL);
   url.searchParams.set('action', action);
   url.searchParams.set('secret', ENV.SHEETS_API_SECRET);
+  url.searchParams.set('_ts', String(Date.now()));
 
   const res = await fetch(url);
-  const json = await res.json();
+  const text = await res.text();
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (_) {
+    if (attempt < 3) {
+      await delay(attempt * 1000);
+      return apiGet(action, attempt + 1);
+    }
+    throw new Error(
+      `${action}: non-JSON response ` +
+      `status=${res.status} ` +
+      `content-type=${res.headers.get('content-type') || ''} ` +
+      `body=${text.slice(0, 300)}`
+    );
+  }
+
   if (!json.ok) throw new Error(json.error || 'Sheets API error');
   return json;
 }
@@ -155,9 +174,73 @@ async function loadContent(force = false) {
   return CONTENT;
 }
 
+function getLeadValue(row, ...keys) {
+  for (const key of keys) {
+    if (
+      Object.prototype.hasOwnProperty.call(row, key) &&
+      row[key] !== undefined &&
+      row[key] !== null
+    ) {
+      return row[key];
+    }
+  }
+  return '';
+}
+
+function normalizeCrmLead(row) {
+  return {
+    ...row,
+    created_at:             getLeadValue(row, 'created_at', 'Дата входа'),
+    last_event_at:          getLeadValue(row, 'last_event_at', 'Последнее событие'),
+    telegram_id:            String(getLeadValue(row, 'telegram_id', 'Telegram ID') || '').trim(),
+    username:               getLeadValue(row, 'username', 'Username'),
+    name:                   getLeadValue(row, 'name', 'Имя'),
+    source:                 String(getLeadValue(row, 'source', 'Источник') || '').trim(),
+    q1:                     getLeadValue(row, 'q1', 'Цель покупки'),
+    q2:                     getLeadValue(row, 'q2', 'Формат покупки'),
+    q3:                     getLeadValue(row, 'q3', 'Способ оплаты'),
+    q4:                     getLeadValue(row, 'q4', 'Комфортный платёж'),
+    q5:                     getLeadValue(row, 'q5', 'Главный стопор'),
+    q6:                     getLeadValue(row, 'q6', 'Как давно смотрит'),
+    q7:                     getLeadValue(row, 'q7', 'Когда хочет разобраться'),
+    segment_code:           getLeadValue(row, 'segment_code', 'Код сегмента'),
+    segment_name:           getLeadValue(row, 'segment_name', 'Сегмент'),
+    readiness:              getLeadValue(row, 'readiness', 'Готовность'),
+    goal_tag:               getLeadValue(row, 'goal_tag', 'Цель'),
+    payment_tag:            getLeadValue(row, 'payment_tag', 'Вход'),
+    last_cta:               getLeadValue(row, 'last_cta', 'Последний CTA'),
+    status:                 getLeadValue(row, 'status', 'Статус'),
+    manager:                getLeadValue(row, 'manager', 'Менеджер'),
+    comment:                getLeadValue(row, 'comment', 'Комментарий'),
+    diagnosis_completed_at: getLeadValue(row, 'diagnosis_completed_at', 'Диагностика завершена'),
+    warmup_started_at:      getLeadValue(row, 'warmup_started_at', 'Прогрев запущен'),
+    current_warmup_day:     Number(getLeadValue(row, 'current_warmup_day', 'День прогрева') || 0),
+    hot_followup_sent:      getLeadValue(row, 'hot_followup_sent', 'Hot follow-up отправлен'),
+    warmup_stopped_at:      getLeadValue(row, 'warmup_stopped_at', 'Прогрев остановлен'),
+  };
+}
+
 async function getCrmLeads() {
   const json = await apiGet('getCrmLeads');
-  return json.leads || [];
+  const rows = Array.isArray(json.leads) ? json.leads : [];
+
+  const leads = rows
+    .map(normalizeCrmLead)
+    .filter(lead => lead.telegram_id);
+
+  const sourceCounts = {};
+  for (const lead of leads) {
+    const source = lead.source || 'empty';
+    sourceCounts[source] = (sourceCounts[source] || 0) + 1;
+  }
+
+  console.log(
+    `CRM API: total=${leads.length}; ` +
+    `sources=${JSON.stringify(sourceCounts)}; ` +
+    `warmup=${leads.filter(l => l.warmup_started_at && !l.warmup_stopped_at).length}`
+  );
+
+  return leads;
 }
 
 function callback(type, value) {
@@ -702,12 +785,13 @@ async function runWarmupTick() {
       if (!row) {
         // Day missing in content — skip to next existing day, don't stop warmup
         const nextDay = warmupDays.find(d => d > day);
+        const alignedWarmupStartedAt = new Date(Date.now() - (day - 1) * DAY_MS).toISOString();
         if (!nextDay) {
           await upsertLead(leadUser, { warmup_stopped_at: new Date().toISOString(), status: CRM_STATUS.warmup_completed });
           await logEvent(leadUser, 'warmup_completed', { source: 'telegram_v2' });
           console.log(`Warmup completed: ${lead.telegram_id}`);
         } else {
-          await upsertLead(leadUser, { current_warmup_day: nextDay });
+          await upsertLead(leadUser, { current_warmup_day: nextDay, warmup_started_at: alignedWarmupStartedAt });
           console.log(`Warmup skip day ${day} -> ${nextDay}: ${lead.telegram_id}`);
         }
         continue;
@@ -720,6 +804,8 @@ async function runWarmupTick() {
         ], content.settings, row.id));
 
         const nextDay = warmupDays.find(d => d > day);
+        // Выравниваем warmup_started_at, чтобы следующий день не отправился раньше времени
+        const alignedWarmupStartedAt = new Date(Date.now() - (day - 1) * DAY_MS).toISOString();
 
         if (!nextDay) {
           await upsertLead(leadUser, { warmup_stopped_at: new Date().toISOString(), status: CRM_STATUS.warmup_completed }, true);
@@ -727,7 +813,7 @@ async function runWarmupTick() {
           await logEvent(leadUser, 'warmup_completed', { source: 'telegram_v2' });
           console.log(`Warmup completed after day ${day}: ${lead.telegram_id}`);
         } else {
-          await upsertLead(leadUser, { current_warmup_day: nextDay, status: CRM_STATUS.in_warmup }, true);
+          await upsertLead(leadUser, { current_warmup_day: nextDay, warmup_started_at: alignedWarmupStartedAt, status: CRM_STATUS.in_warmup }, true);
           await logEvent(leadUser, `warmup_day_${day}_sent`, { source: 'telegram_v2', payload: { origin: `day_${day}` } }, true);
           console.log(`Warmup sent: ${lead.telegram_id} day=${day} -> next=${nextDay}`);
         }
